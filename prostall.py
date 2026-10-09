@@ -3550,6 +3550,8 @@ def self_test():
     check(_parse(["--report", "d"]).report == "d", "--report is read")
     rejects(["--sde-port", "not-a-number"], "a non-numeric port is refused")
     rejects(["--nonsense"], "an unknown flag is refused")
+    rejects(["--ap"], "a unique prefix of --apply is refused, so a short flag "
+            "cannot arm the fix path  <-- pinned defect")
     check(not hasattr(_parse([]), "password"),
           "there is no password option at all: nothing here signs in to "
           "anything, and a connection file is never opened")
@@ -3799,6 +3801,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="prostall.py",
+        allow_abbrev=False,
         description="Diagnose why ArcGIS Pro is slow on this workstation, and "
                     "never report a finding the machine did not produce.",
         epilog="Check by default. Without --apply nothing on the machine "

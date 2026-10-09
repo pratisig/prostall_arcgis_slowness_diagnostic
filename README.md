@@ -112,6 +112,7 @@ PASS  when there was a previous value, the undo restores that value rather than 
 the command line: nothing dangerous is on by default
 PASS  --apply is off by default, so a plain run changes nothing  <-- pinned defect
 PASS  and no host is probed by default, so a plain run sends no packet  <-- pinned defect
+PASS  a unique prefix of --apply is refused, so a short flag cannot arm the fix path  <-- pinned defect
 PASS  there is no password option at all: nothing here signs in to anything, and a connection file is never opened
 PASS  --self-test wins over every other flag, so a test run can neither apply a fix, nor probe a host, nor write a file  <-- pinned defect
 ...
@@ -135,7 +136,7 @@ PASS  a false check, a missing exception, a wrong exception and an accepted argu
 PASS  not one of those four counted as a pass
 PASS  and every one of them printed a line the operator can see
 ----------------------------------------------------------------------
-392 assertions, 0 failed
+393 assertions, 0 failed
 ```
 
 ## Requirements
@@ -158,7 +159,7 @@ one whose registry provider dies mid-run, and one logged in under the wrong prof
 exercises the reading layer itself against a real temporary directory and a real loopback socket,
 and runs the whole tool once, read-only, on the machine you run it on.
 
-The same 392 assertions pass on Windows and on Linux. That matters more than it sounds: the path
+The same 393 assertions pass on Windows and on Linux. That matters more than it sounds: the path
 logic answers questions about Windows paths, and two of the bugs it pins are cases where the
 standard library answers for the host instead of for the path.
 
