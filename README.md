@@ -1,7 +1,9 @@
 # prostall
 
 Diagnose why ArcGIS Pro is slow on this workstation, and never report a finding the machine did
-not produce. Read-only by default: nothing changes and no packet leaves the box.
+not produce. Read-only by default: nothing changes, and no host is contacted unless you name it.
+The one exception is a project folder that already lives on a share. Reading it crosses the
+network, as Pro does when it opens the project.
 
 An editor tells you Pro takes five minutes to open, that it hangs for two or three minutes in the
 middle of an edit, and that sometimes the work she saved before the hang is gone afterwards. There
@@ -20,6 +22,16 @@ forty checks are worth nothing to him either. The three checks that could not be
 workstation are gone. What replaced them is a rule the record constructor enforces: a check that
 says it did not measure cannot carry a verdict, and the self-test asserts it on every status, on
 every check, and across a whole run.
+
+The next round went after the causes the first one never measured, and the same rule caught a new
+liar on the first day. Ask Microsoft Defender for its exclusion lists from the editor's own
+session, and it does not refuse. It answers, and where each list should be it puts one line:
+`N/A: Must be an administrator to view exclusions`. Compare that line against the folders Pro
+needs, and every folder reads as missing. The report then asks the security team for exclusions
+that may already exist, off a list it never saw. prostall recognises that line, says the lists are
+hidden, and gives no verdict. The same run on the test workstation showed the pattern twice more:
+the network adapter's power setting came back empty, and the SMB client log answered "Access is
+denied". Both are reported as unread, not as healthy.
 
 ```
 $ python prostall.py --self-test
@@ -84,6 +96,23 @@ PASS  fifty gigabytes free of a thousand clears the twenty gigabyte floor and wa
 PASS  the high performance plan passes by its identifier alone, under a name that says nothing: a managed image renames the plan, so the guid is the only part that survives  <-- pinned defect
 PASS  the symbology check is always Info: no client setting was found that governs it, and none is invented here  <-- pinned defect
 ----------------------------------------------------------------------
+network power, the event timeline, SMB, share latency, Defender and the .aprx
+PASS  one adapter that reads Disabled beside one nobody could read is Info, never Pass: a Pass off a partial reading is a verdict about a device nobody measured  <-- pinned defect
+PASS  a reply that is not XML is an unread log, not an empty one  <-- pinned defect
+PASS  a Winlogon 1002 is not an Application Hang, even naming the same program: the id alone would report a Pro hang on a machine where Pro never hung  <-- pinned defect
+PASS  no event in the logs that were read is Info, never Pass: a hang the editor waits out leaves no event at all  <-- pinned defect
+PASS  and the log that could not be read is named rather than counted as quiet  <-- pinned defect
+PASS  400 ms warns: the boundary is inclusive  <-- pinned defect
+PASS  the text an unprivileged read gets in place of the lists is recognised as hidden, and decides nothing  <-- pinned defect
+PASS  and it is never compared as a path, which reported every baseline folder missing on a machine that may exclude them all  <-- pinned defect
+PASS  lists hidden by policy are not read as empty  <-- pinned defect
+PASS  an exclusion written as %APPDATA% does not cover the editor's folder: Defender expands it as LocalSystem, under the system profile  <-- pinned defect
+PASS  but it does not stand for three folders  <-- pinned defect
+PASS  and when nobody knows whether Pro runs, it is not opened either  <-- pinned defect
+PASS  a home folder stored as '.' is resolved against the project folder before it is classified, so a project on a share has its home on the share, not on no drive at all  <-- pinned defect
+PASS  a project only partly read is Info, never Pass: the timer could be in the part the cap left out  <-- pinned defect
+...
+----------------------------------------------------------------------
 no fix runs off a determination that was never made
 PASS  a failing check with a fix lets that fix run
 PASS  a healthy check does not
@@ -99,6 +128,11 @@ PASS  not one record in a whole run pairs a verdict with text saying it measured
 PASS  the data-loss block runs and prints first, ahead of every performance finding
 PASS  with --apply absent the applied collection stays empty across a whole run  <-- pinned defect
 PASS  the cache fix is refused while Pro is running, because clearing a live cache corrupts the session  <-- pinned defect
+PASS  with Pro running, not one project file was opened in a whole run  <-- pinned defect
+PASS  the timeline lists the Pro hang and leaves out the Winlogon event and the other program's crash
+PASS  when the Pro check itself dies, the project file is not opened: not knowing whether Pro runs is not the same as knowing it is closed  <-- pinned defect
+PASS  a project folder on a share that takes 650 ms to list warns, with the number in the report
+PASS  with Pro closed the project file is read, and the layer on a thirty-second timer is named
 PASS  of three leftover session folders, the two holding a project file or a scratch table with rows in it are named, and the one holding a bare table header is not: an empty scratch geodatabase is a husk, not a recovery lead  <-- pinned defect
 PASS  a file that is not a dump is not counted as one, because a Windows name filter also matches the short alias  <-- pinned defect
 PASS  a project folder the walk could not open is reported as unreadable rather than as clean: a scan that returns nothing for a folder it could not read says the tree is fine when it has no idea  <-- pinned defect
@@ -123,6 +157,10 @@ PASS  renaming a folder aside moves it and leaves nothing behind, which is what 
 PASS  a listening port is reported open
 PASS  a port with nothing behind it is reported closed
 PASS  and the probe returns inside its own timeout. Not faster than it: Linux refuses a dead loopback port at once, Windows retransmits and times out, and the connect this replaced blocked for tens of seconds against a dead host  <-- pinned defect
+PASS  off Windows every Windows read answers absence, never a guess
+PASS  a reader program that is not installed is a reason, not a traceback and not an empty answer
+PASS  a log that does not exist is an error, not an empty timeline  <-- pinned defect
+PASS  a real project-shaped zip yields its three JSON entries and skips the image
 PASS  memory answers both numbers or neither, so no check can compute a verdict from half a reading  <-- pinned defect
 ----------------------------------------------------------------------
 the tool end to end on the machine running this, read-only
@@ -136,14 +174,15 @@ PASS  a false check, a missing exception, a wrong exception and an accepted argu
 PASS  not one of those four counted as a pass
 PASS  and every one of them printed a line the operator can see
 ----------------------------------------------------------------------
-393 assertions, 0 failed
+514 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `argparse`, `collections`, `json`, `ntpath`, `os`,
-`re`, `socket`, `sys`, `time`, plus `winreg`, `ctypes`, `subprocess` and `shutil` imported inside
-the functions that need them, and `xml.etree`, `io`, `tempfile` for the parser and the self-test.
+`re`, `socket`, `sys`, `time`, plus `winreg`, `ctypes`, `subprocess`, `shutil` and `zipfile`
+imported inside the functions that need them, and `xml.etree`, `io`, `tempfile` for the parsers
+and the self-test.
 It runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the `arcgis`
 package is not needed.
 
@@ -159,9 +198,30 @@ one whose registry provider dies mid-run, and one logged in under the wrong prof
 exercises the reading layer itself against a real temporary directory and a real loopback socket,
 and runs the whole tool once, read-only, on the machine you run it on.
 
-The same 393 assertions pass on Windows and on Linux. That matters more than it sounds: the path
-logic answers questions about Windows paths, and two of the bugs it pins are cases where the
-standard library answers for the host instead of for the path.
+The same 514 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
+labels. That matters more than it sounds: the path logic answers questions about Windows paths,
+and two of the bugs it pins are cases where the standard library answers for the host instead of
+for the path. The reads that only exist on Windows are run twice, once with the platform switched
+off, so each host walks the branch the other one takes and the count stays equal.
+
+On Windows the tool starts two programs that ship with Windows, both read-only: `powershell.exe`
+for `Get-MpPreference`, `Get-NetAdapter`, `Get-NetAdapterPowerManagement` and
+`Get-SmbClientConfiguration`, and `wevtutil qe` for the event logs. It reads a project file with
+`zipfile` and never writes one.
+
+## The existing alternatives
+
+ArcGIS Pro ships the [Diagnostic Monitor](https://pro.arcgis.com/en/pro-app/latest/get-started/arcgis-diagnostic-monitor.htm),
+opened with Ctrl+Alt+M, and it is the right tool for what it does. It traces Pro from inside the
+process, with live counters, tasks and a log, and Esri support can read what it saves. It cannot
+see the workstation around Pro: Known Folder Move, Offline Files, the adapter's power setting or
+Defender's lists. A session that never finished opening gives it nothing to trace.
+
+Event Viewer shows the same events as DL-13, one log at a time. Microsoft's
+[performance analyzer for Defender](https://learn.microsoft.com/en-us/defender-endpoint/tune-performance-defender-antivirus)
+(`New-MpPerformanceRecording`) proves which files on-access scanning actually slows. Run it, elevated,
+before you ask for any exclusion PF-17 lists. prostall puts these readings side by side in one
+report, from the editor's own session, and says which of them it could not read.
 
 ## Quick start
 
@@ -171,8 +231,8 @@ Run it in the editor's own session, without elevation, while Pro is closed.
 python prostall.py
 ```
 
-That reads the machine and prints the report. Nothing is written, no host is contacted, and no
-setting is changed.
+That reads the machine and prints the report. Nothing is written and no setting is changed. No
+host is contacted, apart from reading a recent project folder that already sits on a share.
 
 ```
 python prostall.py --sde-server gisdb01 --portal gis.example.org --report C:\Temp\properf
@@ -200,8 +260,8 @@ credential.
 
 ## What it checks
 
-Twenty-two checks. The eleven that bear on lost edits run first and print first, because silent
-edit loss outranks every performance finding.
+Twenty-eight checks. The thirteen that bear on lost edits run first and print first, because
+silent edit loss outranks every performance finding.
 
 **Data loss**, in the order they run and print.
 
@@ -210,19 +270,23 @@ edit loss outranks every performance finding.
 | DL-00 | Whether the tool is running as the account that actually edits. If another profile carries the Pro data, every per-user result below is invalid. |
 | DL-05 | Where the recently opened projects live: local disk, a share, or a synced folder. |
 | DL-03 | The project backup interval, and that it is not an edit autosave. It copies the project file, never the edit session. |
+| DL-04 | Whether Windows may turn off each physical network adapter that is up, to save power. |
 | DL-06 | Whether Documents is redirected into OneDrive by Known Folder Move. |
 | DL-07 | Dehydrated Files-On-Demand placeholders anywhere under the project tree. |
 | DL-08 | The Offline Files cache, read from the policy value and from nowhere else. |
 | DL-09 | Crash dumps, and what dump collection is configured if there are none. |
 | DL-10 | A bounded TCP connect to the geodatabase host, with its latency. |
 | DL-11 | Connection files on the box, by path, including the copies cached under the search index. |
-| DL-12 | Whether Pro is running right now, which blocks the cache fix. |
+| DL-12 | Whether Pro is running right now, which blocks the cache fix and the project-file read. |
+| DL-13 | The event timeline for the last 14 days: Pro crashes and hangs, dirty shutdowns, and SMB client connectivity warnings. |
 | PF-07 | Leftover session folders, and which of them still hold a project file or a scratch table with rows in it. |
 
 **Performance**
 
 | Id | What it measures |
 |---|---|
+| PF-02 | The SMB client settings, with multichannel graded only when a recent project is on a share. |
+| PF-03 | How long one listing of each share folder holding a recent project takes. |
 | PF-04 | The installed release and build. |
 | PF-05 | The display settings, read only. |
 | PF-06 | The local cache: size, and how much of it is orphaned. |
@@ -231,13 +295,41 @@ edit loss outranks every performance finding.
 | PF-12 | Installed and free memory. |
 | PF-13 | Free space on the system volume and on any local project volume. |
 | PF-15 | The active power plan. |
+| PF-17 | Whether Microsoft Defender excludes the Pro install folder, the editor's ESRI folders and `ArcGISPro.exe`. |
 | PF-19 | A bounded TCP connect to the portal. |
+| PF-22 | Layer refresh timers and the default geodatabase, read from inside each recent `.aprx`, only while Pro is closed. |
 | PF-26 | Whether a roaming profile carries the ESRI settings folder. |
 | PF-27 | Symbology that does not refresh after a field calculation. |
 
 PF-07 keeps its performance id and runs in the data-loss block on purpose. An earlier version
 reported those folders as a count and a size and called it disk churn, which routed a possible
 recovery lead for the lost work into the performance section and out of the act-first list.
+
+### How the six newer checks stay honest
+
+- **DL-04, adapter power.** One adapter that reads `Disabled` beside one nobody could read is
+  `Info`, never `Pass`. An unelevated read often answers nothing for the setting, and did on the
+  test workstation.
+- **DL-13, event timeline.** Each log is queried with `wevtutil qe`. A log that answers "Access is
+  denied", or a reply that is not XML, is named as unreadable. It is never counted as a quiet log.
+  Events are matched on the provider as well as the id, because Winlogon also writes event 1002.
+  No event is `Info`, never `Pass`: a hang the editor waits out leaves no event at all. The SMB
+  client ids are printed uninterpreted, because no published Microsoft reference gives them a
+  meaning.
+- **PF-02 and PF-03, SMB and share latency.** Multichannel is on by default in Windows. Off, it
+  warns only when a recent project is on a share. The listing time is graded at 400 ms (Warn) and
+  1500 ms (Fail). Those are this tool's allowances, not a published figure.
+- **PF-17, Defender.** The `N/A: Must be an administrator to view exclusions` line is recognised and
+  never compared as a path. Real-time scanning off, or lists hidden by
+  `HideExclusionsFromLocalAdmins`, are `Info` too. Defender expands variables as LocalSystem, so an
+  exclusion written as `%APPDATA%\ESRI` covers the system profile, not the editor's folder, and is
+  reported that way. An asterisk in a folder path stands for exactly one folder. The baseline is
+  this tool's, not an Esri list. Review it against your antivirus standard.
+- **PF-22, the `.aprx`.** The project file is opened only when DL-12 found Pro closed. Pro running,
+  or DL-12 failing, refuses the read, because a read holds the file open while Pro may be saving it.
+  `defaultFolder` and `defaultGeoDatabase` are resolved against the project folder before they are
+  classified, because Pro stores `.` for a home folder that is the project folder. A project read
+  only in part, because a size or count cap was reached, is `Info`, never `Pass`.
 
 Three checks were deleted rather than rewritten. Two read a geodatabase the workstation cannot see,
 and the third read an attribute rule definition that lives on the server. All three printed
@@ -298,7 +390,8 @@ AP-01 renames. It does not delete. A diagnostic that deletes a folder is how the
 something disappears, and the undo is a single `move` back.
 
 Nothing else is automated, on purpose. OneDrive redirection, the project location, the power plan,
-Defender, dump collection and anything inside a geodatabase are reported and never touched. Those
+Defender, the adapter power setting, the SMB client, the project file, dump collection and anything
+inside a geodatabase are reported and never touched. Those
 are policy decisions or reviewed operator actions, and a script that makes them for you is a script
 nobody will run twice.
 
@@ -345,13 +438,59 @@ empty unless `--apply` was given, and the self-test asserts that across a whole 
   name does not exist on current builds, and on a machine whose folders were all redirected it
   rendered as absent, so the line contradicted the finding. The verdict comes from the Documents
   path, which is measured directly.
-- No event log, no WMI, no scheduled tasks. Those need either a heavier dependency or an elevated
-  session, and every reading here is meant to work from the editor's own unelevated session.
+- The event log is read through `wevtutil`, unelevated. The Application and System logs answer
+  there. The SMB client connectivity log answered "Access is denied" on the test workstation, so
+  DL-13 names it as unreadable unless the run is elevated. No WMI and no scheduled tasks are read.
+- The `Application Hang` provider name is the one Windows Error Reporting writes, but the test
+  workstation had no hang event to read it from. The query that names it ran there and returned
+  an empty list, not an error. `Application Error`, `Microsoft-Windows-Kernel-Power` and `EventLog`
+  were read from real events on that machine.
+- PF-17 approximates Defender's matching: an exact or parent folder, one folder per asterisk, a
+  question mark for one character, and the LocalSystem variables. A contextual exclusion (one with
+  `\:{...}`) is not counted, because it may not apply to on-access scanning. Prove a slow scan
+  with the Defender performance analyzer before asking for an exclusion.
+- PF-22 reads projects that store their contents as JSON, which is the layout of current releases.
+  A project with no JSON inside is reported unreadable. The read is capped at 300 entries, 4 MB per
+  entry and 32 MB in all.
+- PF-03 was exercised against a local folder and a stand-in share, not against a real file server.
 - It finds recently opened projects by looking under the Documents project folder. A project kept
   somewhere else is not in that list, and DL-05 says what it looked at rather than claiming
   coverage.
-- It does not diagnose a network. `DL-10` says the host answered in so many milliseconds. Why it
-  was slow is somebody else's tool.
+- It does not diagnose a network. `DL-10` says the host answered in so many milliseconds, and PF-03
+  says how long a share took to list a folder. Why it was slow is somebody else's tool.
+- Branch coverage of the self-test is 98% on Windows. The lines it cannot reach offline are all in
+  the reading layer: `Env.reg_write`, which only `--apply` reaches and the self-test must never
+  run against a real registry; the `OSError` branches of `Env.isdir`, `Env.isfile`, `Env.subdirs`
+  and `Env.scan`, which need a folder that vanishes or locks mid-walk; the failure branches of
+  `Env.elevated`, `Env.processes`, `Env.memory` and `Env.power_plan` on a working Windows host; the
+  line in `Env.processes` that reads a running Pro; the kill of a child that hangs for two minutes
+  in `Env._run`; the self-test's own failure summary; and the note `main` prints off Windows,
+  which the Linux run covers.
+
+## Sources
+
+Every Windows, Esri and Defender behaviour the newer checks rely on, and where it is documented:
+
+- `wevtutil qe` with `/q`, `/c`, `/rd`, `/f:xml` and `/e` for the root element:
+  [wevtutil](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wevtutil).
+- Kernel-Power 41 and EventLog 6008:
+  [Event ID 41](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart).
+- `AllowComputerToTurnOffDevice` values `Unsupported`, `Disabled`, `Enabled`:
+  [MSFT_NetAdapterPowerManagementSettingData](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/hh872363(v=vs.85)).
+- Multichannel on by default:
+  [Manage SMB Multichannel](https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/manage-smb-multichannel).
+  The settings read: [Set-SmbClientConfiguration](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration).
+- Exclusions hidden from `Get-MpPreference` by `HideExclusionsFromLocalAdmins`:
+  [Configure custom exclusions](https://learn.microsoft.com/en-us/defender-endpoint/configure-exclusions-microsoft-defender-antivirus).
+  Wildcards, one folder per asterisk, and variables expanded as LocalSystem:
+  [Exclusions in Microsoft Defender Antivirus](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-overview).
+  The `N/A: Must be an administrator to view exclusions` line is not in that documentation. It was
+  read from a real unelevated `Get-MpPreference` on the test workstation.
+- `refreshRate` and `refreshRateUnit` on a layer, and `defaultFolder` and `defaultGeoDatabase` on
+  `CIMGISProject`: the [CIM specification](https://github.com/Esri/cim-spec) (`CIMLayer.md` and
+  `CIMDocument.md`). The specification does not say that an `.aprx` holds those documents as JSON
+  inside a zip. That was read from real Pro projects on the test workstation, where the relative
+  `.` home folder was resolved as described above.
 
 ## Related
 

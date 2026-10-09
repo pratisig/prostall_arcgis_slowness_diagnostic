@@ -20,7 +20,9 @@ this fills, from the outside, before the case is opened.
 Check by default. A plain run reads and prints. --apply is the only path that
 changes machine state, every applied change prints its own undo, and nothing
 here deletes anything. The network probes are opt-in: without --sde-server and
---portal no packet leaves the machine.
+--portal no host is contacted. The one exception is a project folder that
+already lives on a share: reading it crosses the network, as Pro does when it
+opens the project, and PF-03 times one listing of it.
 
     python prostall.py --self-test
     python prostall.py
@@ -114,6 +116,45 @@ CACHE_STALE_RATIO = 0.8
 CRASH_RECENT_DAYS = 45
 PROTEMP_MANY = 25
 INDEX_MANY_CONNECTIONS = 10
+
+# The event timeline reads this many days back, and at most this many events
+# per log. A log that hits the cap is reported as capped, not as complete.
+EVENT_WINDOW_DAYS = 14
+EVENT_MAX = 200
+
+# One directory listing on the project share. These are this tool's
+# allowances, not a published figure: Pro lists folders many times while it
+# opens a project, so a single listing in the hundreds of milliseconds is
+# already the slow open the editor describes.
+SHARE_LIST_WARN_MS = 400
+SHARE_LIST_FAIL_MS = 1500
+SHARE_LIST_LIMIT = 500
+
+# The .aprx read is bounded, because a project on a share is exactly where a
+# full read is slow.
+APRX_MAX_PROJECTS = 3
+APRX_MAX_ENTRIES = 300
+APRX_MAX_ENTRY_BYTES = 4 * 1024 ** 2
+APRX_MAX_BYTES = 32 * 1024 ** 2
+
+# Get-MpPreference does not fail for a caller who may not see the exclusion
+# lists. It puts this text where each list would be. Compared as a path, it
+# reports every exclusion missing on a machine that may have them all.
+DEFENDER_SENTINEL = re.compile(r"^\s*N/A\s*:|must be an administrator",
+                               re.IGNORECASE)
+
+# Defender expands variables in an exclusion as LocalSystem, not as the user.
+# These four resolve under the system profile, so an exclusion written with
+# one of them never covers the editor's own folder.
+LOCALSYSTEM_PROFILE_VARS = {
+    "USERPROFILE": r"System32\config\systemprofile",
+    "APPDATA": r"System32\config\systemprofile\AppData\Roaming",
+    "LOCALAPPDATA": r"System32\config\systemprofile\AppData\Local",
+    "TEMP": r"TEMP",
+    "TMP": r"TEMP",
+}
+
+EVENT_NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
 # An empty file geodatabase table file is a bare header. Anything larger holds
 # rows, which is the difference between the husk of a crashed session and the
@@ -1272,6 +1313,563 @@ def decide_symbology(feature_caching):
             "Diagnostic Monitor trace. It is a client defect, not a setting.")
 
 
+# ------------------------------------------------ the causes added in 1.6
+
+def as_list(value):
+    """A PowerShell JSON answer as a list. One object arrives bare, not listed."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def decide_nic(adapters, error):
+    """DL-04. May Windows turn the network adapter off to save power?
+
+    adapters: (name, description, state) per physical adapter that is up,
+    where state is Enabled, Disabled, Unsupported, or None when unreadable.
+
+    An adapter whose setting nobody could read keeps the check undetermined,
+    even beside an adapter that reads Disabled. Pass on a partial reading is
+    a verdict about a device nobody measured.
+    """
+    if error is not None:
+        return dict(
+            cid="DL-04", category="Network", dataloss=True, status="Info",
+            measured=False,
+            title="Network adapter power management",
+            observed="The adapter list could not be read: %s" % error,
+            expected="Allow the computer to turn off this device: Disabled on "
+                     "every adapter that carries the database session.",
+            impact="S2 and S3 undetermined.",
+            fix="Read it by hand: Device Manager > the adapter > Power "
+                "Management.")
+    if not adapters:
+        return dict(
+            cid="DL-04", category="Network", dataloss=True, status="Info",
+            measured=False,
+            title="Network adapter power management",
+            observed="No physical adapter reported up, so the power setting "
+                     "could not be determined.",
+            expected="At least one physical adapter up.",
+            impact="S2 and S3 undetermined.",
+            fix="Read it by hand: Device Manager > the adapter > Power "
+                "Management.")
+    lines = []
+    enabled = []
+    unknown = []
+    for name, description, state in adapters:
+        lines.append("%s [%s] AllowComputerToTurnOffDevice = %s"
+                     % (name, description, state or "<unreadable>"))
+        if state == "Enabled":
+            enabled.append(name)
+        elif state not in ("Disabled", "Unsupported"):
+            unknown.append(name)
+    if enabled:
+        return dict(
+            cid="DL-04", category="Network", dataloss=True, status="Warn",
+            title="Windows may turn the network adapter off to save power",
+            observed=lines,
+            expected="Disabled on every adapter that carries the database "
+                     "session.",
+            impact="S2 and S3. With this on, Windows may power the adapter "
+                   "down, and an edit session left open across that loses its "
+                   "connection to the database.",
+            fix="Device Manager > %s > Power Management > clear Allow the "
+                "computer to turn off this device to save power. Not "
+                "auto-fixed: it is a machine-wide device setting and needs an "
+                "administrator." % enabled[0],
+            detail="Adapters to change: %s" % ", ".join(enabled))
+    if unknown:
+        return dict(
+            cid="DL-04", category="Network", dataloss=True, status="Info",
+            measured=False,
+            title="Network adapter power management",
+            observed=lines + ["The setting could not be read for %d adapter(s), "
+                              "so a Pass here would be a guess."
+                              % len(unknown)],
+            expected="A readable setting on every adapter that is up. The "
+                     "provider often answers nothing for a docking or USB "
+                     "adapter, or when the session is not elevated.",
+            impact="S2 and S3 undetermined.",
+            fix="Re-run elevated, or read it in Device Manager > the adapter "
+                "> Power Management.")
+    return dict(
+        cid="DL-04", category="Network", dataloss=True, status="Pass",
+        title="Windows will not turn the network adapter off to save power",
+        observed=lines,
+        expected="Disabled or unsupported on every adapter that is up.",
+        impact="None.", fix="None.")
+
+
+def classify_event(log, event):
+    """What one event means for the timeline, or None when it is not ours.
+
+    Matched on the provider as well as the id. Event 1002 is also written by
+    Winlogon, and a timeline that counted it would report a Pro hang on a
+    machine where Pro never hung.
+    """
+    provider = event["provider"]
+    eid = event["id"]
+    if log == "Application":
+        if not [d for d in event["data"]
+                if ntpath.basename(d or "").lower() == "arcgispro.exe"]:
+            return None
+        if provider == "Application Error" and eid == 1000:
+            return "ArcGIS Pro crashed (Application Error 1000)"
+        if provider == "Application Hang" and eid == 1002:
+            return "ArcGIS Pro hung and was ended (Application Hang 1002)"
+        return None
+    if log == "System":
+        if provider == "Microsoft-Windows-Kernel-Power" and eid == 41:
+            return "Windows restarted without a clean shutdown (Kernel-Power 41)"
+        if provider == "EventLog" and eid == 6008:
+            return "the previous shutdown was unexpected (EventLog 6008)"
+        return None
+    if event["level"] in (1, 2, 3):
+        return ("SMB client connectivity event %d, level %d, uninterpreted"
+                % (eid, event["level"]))
+    return None
+
+
+def parse_events(text):
+    """The events in one wevtutil XML answer, or None when it is not XML.
+
+    Unparsable output is an unread log, not an empty one: an empty timeline
+    off a reply nobody could read is the same lie as a verdict with no
+    measurement.
+    """
+    from xml.etree import ElementTree
+
+    try:
+        root = ElementTree.fromstring(text or "")
+    except ElementTree.ParseError:
+        return None
+    out = []
+    for node in root.iter(EVENT_NS + "Event"):
+        system = node.find(EVENT_NS + "System")
+        if system is None:
+            continue
+        provider = system.find(EVENT_NS + "Provider")
+        created = system.find(EVENT_NS + "TimeCreated")
+        try:
+            eid = int(system.findtext(EVENT_NS + "EventID", "").strip())
+            level = int(system.findtext(EVENT_NS + "Level", "0").strip() or 0)
+        except ValueError:
+            continue
+        when = (created.get("SystemTime", "") if created is not None else "")
+        out.append({
+            "provider": provider.get("Name", "") if provider is not None else "",
+            "id": eid,
+            "level": level,
+            "when": when[:19].replace("T", " "),
+            "data": [d.text or "" for d in node.iter(EVENT_NS + "Data")],
+        })
+    return out
+
+
+def decide_events(rows, unreadable, queried, capped):
+    """DL-13. The wall-clock record of hangs, crashes and dirty shutdowns.
+
+    rows: (when, what). unreadable: (log, reason). capped: logs that hit the
+    event cap. No event is never Pass: a hang the editor waits out leaves no
+    event at all, so an empty window is absence of evidence.
+    """
+    lines = ["Window: the last %d days, newest first, times in UTC."
+             % EVENT_WINDOW_DAYS]
+    for log, reason in unreadable:
+        lines.append("%s: unreadable (%s)" % (log, reason))
+    for log in capped:
+        lines.append("%s: capped at %d events, so older ones are not shown"
+                     % (log, EVENT_MAX))
+    if rows:
+        ordered = sorted(rows, reverse=True)
+        lines.extend(["%s  %s" % pair for pair in ordered[:40]])
+        if len(ordered) > 40:
+            lines.append("... %d more event(s) not listed."
+                         % (len(ordered) - 40))
+        return dict(
+            cid="DL-13", category="System", dataloss=True, status="Warn",
+            title="Event timeline: Pro hangs, crashes or dirty shutdowns are "
+                  "recorded on this machine",
+            observed=lines,
+            expected="No ArcGIS Pro crash or hang, and no unexpected shutdown, "
+                     "during editing hours.",
+            impact="S2 and S3. This is the wall-clock evidence. A hang ended "
+                   "from Task Manager writes no dump (DL-09), but it can leave "
+                   "an Application Hang event, and its time is the moment the "
+                   "edit session died.",
+            fix="Give these times to the editor and to the support case, and "
+                "lay them beside the edit she says she lost. Read-only: "
+                "nothing is cleared.",
+            detail="Sources: Application (Application Error 1000, Application "
+                   "Hang 1002, naming ArcGISPro.exe); System (Kernel-Power "
+                   "41, EventLog 6008); SMB client connectivity warnings and "
+                   "errors, ids printed uninterpreted.")
+    if len(unreadable) == queried:
+        return dict(
+            cid="DL-13", category="System", dataloss=True, status="Info",
+            measured=False,
+            title="Event timeline",
+            observed=lines + ["No log could be read, so the timeline was not "
+                              "measured this run."],
+            expected="Readable Application and System logs.",
+            impact="S2 and S3 undetermined.",
+            fix="Read the same events in Event Viewer, or re-run where the "
+                "logs are readable.")
+    lines.append("No Pro crash or hang and no dirty shutdown in the logs that "
+                 "were read. That is not a clean bill of health: a hang the "
+                 "editor waits out leaves no event, and the incident may be "
+                 "older than the window.")
+    return dict(
+        cid="DL-13", category="System", dataloss=True, status="Info",
+        title="Event timeline: nothing recorded in the window",
+        observed=lines,
+        expected="No ArcGIS Pro crash or hang, and no unexpected shutdown.",
+        impact="S2 and S3. Absence of an event is absence of evidence.",
+        fix="If the incident is older than the window, read the same events "
+            "from an archived log instead.")
+
+
+def decide_smb(config, error, share_projects):
+    """PF-02. The SMB client settings, read for the share the projects use.
+
+    Multichannel is on by default. Off, it is a departure worth a line only
+    when a recent project actually lives on a share; otherwise the setting
+    is recorded for the diff and decides nothing.
+    """
+    if config is None:
+        return dict(
+            cid="PF-02", category="Network", status="Info", measured=False,
+            title="SMB client configuration",
+            observed="The SMB client configuration could not be read: %s"
+                     % error,
+            expected="A readable SMB client configuration.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it by hand with Get-SmbClientConfiguration.")
+    names = ("EnableMultiChannel", "RequireSecuritySignature",
+             "DirectoryCacheLifetime", "FileInfoCacheLifetime",
+             "SessionTimeout")
+    lines = ["%s = %s" % (n, config.get(n, "<absent>")) for n in names]
+    lines.append("recent projects on a share: %d" % share_projects)
+    status = "Info"
+    if config.get("EnableMultiChannel") is False and share_projects:
+        status = "Warn"
+    return dict(
+        cid="PF-02", category="Network", status=status,
+        title="SMB client configuration (read-only)",
+        observed=lines,
+        expected="Multichannel on, which is the Windows default, wherever a "
+                 "project is opened from a share.",
+        impact="S1 and S2 when a project or geodatabase is on a share.",
+        fix="Multichannel is a machine-wide network setting. Raise it with "
+            "the desktop or network team. Not auto-fixed.")
+
+
+def decide_share_latency(rows):
+    """PF-03. One directory listing on the share each remote project uses.
+
+    rows: (folder, elapsed_ms or None, entries, error).
+    """
+    if not rows:
+        return dict(
+            cid="PF-03", category="Network", status="Info",
+            title="Directory listing time on the project share",
+            observed="No recent project lives on a share, so there was no "
+                     "share folder to time.",
+            expected="Projects on a local disk.", impact="None.", fix="None.")
+    lines = []
+    timed = []
+    for folder, elapsed, entries, error in rows:
+        if elapsed is None:
+            lines.append("unreadable  %s  (%s)" % (folder, error))
+            continue
+        timed.append(elapsed)
+        lines.append("%6d ms  %d entries  %s" % (elapsed, entries, folder))
+    if not timed:
+        return dict(
+            cid="PF-03", category="Network", status="Info", measured=False,
+            title="Directory listing time on the project share",
+            observed=lines + ["No share folder could be listed, so the latency "
+                              "was not measured this run."],
+            expected="A listable project folder.",
+            impact="S1 undetermined.",
+            fix="Check that the share is reachable from this session.")
+    worst = max(timed)
+    if worst >= SHARE_LIST_FAIL_MS:
+        status = "Fail"
+    elif worst >= SHARE_LIST_WARN_MS:
+        status = "Warn"
+    else:
+        status = "Pass"
+    return dict(
+        cid="PF-03", category="Network", status=status,
+        title="Directory listing time on the project share",
+        observed=lines,
+        expected="One listing of at most %d entries well under %d ms. Pro "
+                 "lists folders many times while it opens a project."
+                 % (SHARE_LIST_LIMIT, SHARE_LIST_WARN_MS),
+        impact="S1. Every folder listing Pro makes at open pays this.",
+        fix="Copy the working project to a local disk for active editing. If "
+            "the share must be used, give the network team this number.")
+
+
+def _pattern_covers(pattern, target, same_depth=False):
+    """Does a Defender exclusion pattern cover this path?
+
+    Segment by segment, because Defender's asterisk in a folder path matches
+    exactly one folder, and once the named folders match, everything below is
+    covered. A process exclusion names one file, so it must match at the same
+    depth.
+    """
+    def parts(path):
+        return [p for p in path.replace("/", "\\").lower().rstrip("\\")
+                .split("\\")]
+    want = parts(pattern)
+    have = parts(target)
+    if len(want) > len(have) or (same_depth and len(want) != len(have)):
+        return False
+    for w, h in zip(want, have):
+        rx = "^%s$" % re.escape(w).replace("\\*", ".*").replace("\\?", ".")
+        if not re.match(rx, h):
+            return False
+    return True
+
+
+def defender_expand(entry, system_env):
+    """Expand %NAME% in an exclusion the way Defender does, as LocalSystem.
+
+    An unknown variable stays as written, so it matches nothing rather than
+    matching the editor's folder by accident.
+    """
+    def replace(match):
+        return system_env.get(match.group(1).upper(), match.group(0))
+    return re.sub(r"%([A-Za-z_()0-9]+)%", replace, entry or "")
+
+
+def decide_defender(prefs, error, base_paths, pro_exe, system_env):
+    """PF-17. Is Defender scanning the folders Pro reads and writes most?
+
+    prefs: the Get-MpPreference fields, or None. The sentinel text an
+    unprivileged read gets in place of each list is recognised as unreadable,
+    never compared as a path: compared, it reported every baseline folder
+    missing on a machine that may already exclude them all.
+    """
+    if prefs is None:
+        return dict(
+            cid="PF-17", category="Security", status="Info", measured=False,
+            title="Microsoft Defender exclusions for ArcGIS Pro",
+            observed="The Defender preferences could not be read: %s. Another "
+                     "product may be the scanner here." % error,
+            expected="A readable Defender configuration.",
+            impact="S1 and S2 undetermined.",
+            fix="Ask the security team which product scans on access here.")
+    paths = [p for p in as_list(prefs.get("ExclusionPath")) if p]
+    procs = [p for p in as_list(prefs.get("ExclusionProcess")) if p]
+    lines = ["DisableRealtimeMonitoring = %s"
+             % prefs.get("DisableRealtimeMonitoring")]
+    baseline = (["path     %s" % p for p in base_paths]
+                + ["process  %s" % pro_exe])
+    if [p for p in paths + procs if DEFENDER_SENTINEL.search("%s" % p)]:
+        return dict(
+            cid="PF-17", category="Security", status="Info", measured=False,
+            title="Microsoft Defender exclusions are hidden from this session",
+            observed=lines + ["Defender put \"N/A: Must be an administrator "
+                              "to view exclusions\" where each list should "
+                              "be, so what is excluded could not be "
+                              "determined. Baseline that would be checked:"]
+                     + ["  " + b for b in baseline],
+            expected="A read that returns the real lists.",
+            impact="S1 and S2 undetermined. Nothing here says the baseline is "
+                   "missing.",
+            fix="Re-run elevated, or ask the security team for the list. Do "
+                "not request exclusions off this run: it never saw what is "
+                "already configured.")
+    if prefs.get("DisableRealtimeMonitoring") is True:
+        return dict(
+            cid="PF-17", category="Security", status="Info",
+            title="Defender real-time scanning is off",
+            observed=lines,
+            expected="Exclusions decide nothing while real-time scanning is "
+                     "off. Another product may be scanning instead.",
+            impact="None from Defender.",
+            fix="Ask the security team which product scans on access here.")
+    if prefs.get("HideExclusionsFromLocalAdmins") is True and not paths:
+        return dict(
+            cid="PF-17", category="Security", status="Info", measured=False,
+            title="Microsoft Defender exclusions are hidden by policy",
+            observed=lines + ["HideExclusionsFromLocalAdmins = True and no "
+                              "list came back, so what is excluded could not "
+                              "be determined."],
+            expected="A read that returns the real lists.",
+            impact="S1 and S2 undetermined.",
+            fix="Ask the security team for the configured list.")
+    expanded = [defender_expand(p, system_env) for p in paths
+                if "\\:{" not in p]
+    missing = [b for b in base_paths
+               if not [p for p in expanded if _pattern_covers(p, b)]]
+    image = ntpath.basename(pro_exe).lower()
+    proc_ok = [p for p in procs
+               if ("\\" not in p and p.lower() == image)
+               or ("\\" in p and _pattern_covers(defender_expand(p, system_env),
+                                                 pro_exe, same_depth=True))]
+    lines.append("Configured path exclusions: %d; process exclusions: %d"
+                 % (len(paths), len(procs)))
+    lines.extend(["  path     %s" % p for p in paths[:20]])
+    lines.extend(["  process  %s" % p for p in procs[:20]])
+    lines.extend(["NOT EXCLUDED  path     %s" % m for m in missing])
+    if not proc_ok:
+        lines.append("NOT EXCLUDED  process  %s" % pro_exe)
+    return dict(
+        cid="PF-17", category="Security",
+        status="Warn" if (missing or not proc_ok) else "Pass",
+        title="Microsoft Defender exclusions for ArcGIS Pro",
+        observed=lines,
+        expected="The Pro install folder and the editor's ESRI folders "
+                 "excluded, and ArcGISPro.exe excluded as a process. This "
+                 "baseline is this tool's, not an Esri list: review it against "
+                 "the organisation's antivirus standard.",
+        impact="S1 and S2 when on-access scanning is what is slow. Prove it "
+               "first with the Defender performance analyzer.",
+        fix="Ask the security team to review the folders marked NOT EXCLUDED. "
+            "Defender expands a variable in an exclusion as LocalSystem, so "
+            "%APPDATA% there is not the editor's folder: give the real path. "
+            "Not auto-fixed: exclusions are a security decision.")
+
+
+def scan_aprx(path, texts, onedrive):
+    """What one project file says about its home folder and its refresh timers.
+
+    texts: (entry name, JSON text) from inside the .aprx. defaultFolder and
+    defaultGeoDatabase are resolved against the project folder before they
+    are classified: Pro stores "." for a home folder that is the project
+    folder itself, and "." on its own is never a share.
+    """
+    folder = ntpath.dirname(path)
+    out = {"path": path, "home": None, "gdb": None, "refresh": [],
+           "parsed": 0}
+
+    def walk(node, name):
+        if isinstance(node, dict):
+            rate = node.get("refreshRate")
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool) \
+                    and rate > 0:
+                out["refresh"].append("%s: %s refreshRate = %s %s"
+                                      % (name, node.get("name", "<unnamed>"),
+                                         rate,
+                                         node.get("refreshRateUnit", "")))
+            for value in node.values():
+                walk(value, name)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, name)
+
+    for name, text in texts:
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            continue
+        out["parsed"] += 1
+        if isinstance(doc, dict):
+            for key, slot in (("defaultFolder", "home"),
+                              ("defaultGeoDatabase", "gdb")):
+                raw = doc.get(key)
+                if raw and out[slot] is None:
+                    full = ntpath.normpath(ntpath.join(folder, raw))
+                    out[slot] = (raw, full, path_class(full, onedrive))
+        walk(doc, name)
+    return out
+
+
+def decide_aprx(pro_state, projects):
+    """PF-22. Layer refresh timers and the default geodatabase, from the .aprx.
+
+    pro_state: "closed", "running" or "unknown". The read is refused unless
+    Pro is known to be closed. Reading a project file holds it open, and a
+    save that lands while it is held can fail, which would make this
+    diagnostic cause the failure it was run to explain. Not knowing whether
+    Pro runs refuses it too.
+
+    projects: dicts from scan_aprx, or {"path", "error"} for one that could
+    not be opened, each with "truncated".
+    """
+    title = "Layer refresh timers and default geodatabase (read from the .aprx)"
+    if pro_state != "closed":
+        return dict(
+            cid="PF-22", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project file was opened: %s, and reading one holds "
+                     "it open while Pro may be saving it. The project file "
+                     "was not measured this run."
+                     % ("ArcGIS Pro is running" if pro_state == "running"
+                        else "whether ArcGIS Pro is running was not "
+                             "determined"),
+            expected="Pro closed, so the project can be read without "
+                     "contending with a save.",
+            impact="S2 undetermined.",
+            fix="Have the editor save and exit Pro, then re-run. Until then "
+                "check each layer's refresh interval by hand.")
+    if not projects:
+        return dict(
+            cid="PF-22", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No recent project was found, so no project file was "
+                     "read.",
+            expected="A recent project to read.", impact="S2 undetermined.",
+            fix="Check each layer's refresh interval by hand.")
+    lines = []
+    hits = []
+    remote_gdb = []
+    incomplete = []
+    for p in projects:
+        if p.get("error") or not p.get("parsed"):
+            incomplete.append(p["path"])
+            lines.append("unreadable  %s  (%s)"
+                         % (p["path"], p.get("error")
+                            or "no JSON document inside, which is the layout "
+                               "of an older release"))
+            continue
+        lines.append(p["path"])
+        for label, slot in (("home folder", "home"),
+                            ("default gdb", "gdb")):
+            value = p.get(slot)
+            if value is None:
+                lines.append("   %-12s: <absent>" % label)
+                continue
+            lines.append("   %-12s: %s -> %s  [%s]" % (label, value[0],
+                                                      value[1], value[2]))
+            if slot == "gdb" and value[2] != "LOCAL":
+                remote_gdb.append(value[1])
+        for hit in p["refresh"]:
+            hits.append(hit)
+            lines.append("   refresh     : %s" % hit)
+        if p.get("truncated"):
+            incomplete.append(p["path"])
+            lines.append("   scan capped, so this project was not read in "
+                         "full")
+    if hits or remote_gdb:
+        status = "Warn"
+    elif incomplete:
+        status = "Info"
+    else:
+        status = "Pass"
+    return dict(
+        cid="PF-22", category="ArcGISPro", status=status, title=title,
+        observed=lines,
+        expected="No layer on a refresh timer against a slow source, and the "
+                 "default geodatabase on a local disk.",
+        impact="S2. A layer with a refresh interval re-queries on a timer "
+               "with nobody touching the map, which is a stall the editor "
+               "reads as the project refreshing. A default geodatabase on a "
+               "share pays the share on every geoprocessing write.",
+        fix="Clear the refresh interval in the properties of each layer "
+            "listed, and point the default geodatabase at a local "
+            "folder. This tool never writes the project file.",
+        detail=("Not read in full: " + "; ".join(incomplete)) if incomplete
+               else "Every project listed was read in full.")
+
+
 # =============================================================================
 # THE PLATFORM SURFACE. Every read the checks make goes through one object, so
 # the whole diagnostic can be driven from a stand-in machine in the self-test.
@@ -1572,6 +2170,141 @@ class Env(object):
         finally:
             sock.close()
 
+    # -- read-only PowerShell, event log, share and project reads (1.6) ------
+
+    powershell = "powershell.exe"
+    wevtutil = "wevtutil"
+
+    def _run(self, argv):
+        """(returncode, stdout text, first stderr line) of one bounded child."""
+        import subprocess   # imported here so a plain non-Windows run never
+                            # spawns anything
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        try:
+            out, err = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()   # ponytail: a hung child is not reproducible offline
+            proc.communicate()
+            raise
+        lines = [l.strip() for l in err.decode("utf-8", "replace").splitlines()
+                 if l.strip()]
+        return (proc.returncode, out.decode("utf-8", "replace"),
+                lines[0] if lines else "exit code %d" % proc.returncode)
+
+    def _powershell_json(self, script):
+        """(parsed JSON, None) or (None, reason). Never a guess between them.
+
+        A script that throws exits non-zero under Stop, so a failed read comes
+        back as a reason rather than as an empty answer.
+        """
+        if not self.windows:
+            return None, "PowerShell is read on Windows only"
+        try:
+            code, out, err = self._run(
+                [self.powershell, "-NoProfile", "-NonInteractive", "-Command",
+                 "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding "
+                 "= [Text.Encoding]::UTF8; " + script])
+        except Exception as exc:
+            return None, "%s: %s" % (type(exc).__name__, exc)
+        if code != 0:
+            return None, err
+        try:
+            return json.loads(out.lstrip(u"\ufeff").strip()), None
+        except ValueError:
+            return None, "PowerShell printed something that is not JSON"
+
+    def defender_preferences(self):
+        """The Defender fields PF-17 reads, as a dict, or (None, reason)."""
+        return self._powershell_json(
+            "$p = Get-MpPreference; ConvertTo-Json -Compress -InputObject "
+            "@{DisableRealtimeMonitoring = $p.DisableRealtimeMonitoring; "
+            "HideExclusionsFromLocalAdmins = $p.HideExclusionsFromLocalAdmins; "
+            "ExclusionPath = @($p.ExclusionPath); "
+            "ExclusionProcess = @($p.ExclusionProcess)}")
+
+    def nic_power(self):
+        """[{name, description, state}] for each physical adapter that is up."""
+        return self._powershell_json(
+            "$r = @(Get-NetAdapter -Physical | Where-Object { $_.Status -eq "
+            "'Up' } | ForEach-Object { $pm = Get-NetAdapterPowerManagement "
+            "-Name $_.Name -ErrorAction SilentlyContinue; [pscustomobject]@{"
+            "name = $_.Name; description = $_.InterfaceDescription; state = "
+            "$(if ($pm) { [string]$pm.AllowComputerToTurnOffDevice } else "
+            "{ $null })} }); ConvertTo-Json -Compress -InputObject $r")
+
+    def smb_client(self):
+        """The SMB client settings PF-02 reads, as a dict, or (None, reason)."""
+        return self._powershell_json(
+            "$c = Get-SmbClientConfiguration; ConvertTo-Json -Compress "
+            "-InputObject @{EnableMultiChannel = $c.EnableMultiChannel; "
+            "RequireSecuritySignature = $c.RequireSecuritySignature; "
+            "DirectoryCacheLifetime = $c.DirectoryCacheLifetime; "
+            "FileInfoCacheLifetime = $c.FileInfoCacheLifetime; "
+            "SessionTimeout = $c.SessionTimeout}")
+
+    def events(self, log, query, count):
+        """(XML text, None) or (None, reason) for one bounded event query.
+
+        A log with no matching event answers an empty root element and exit
+        0. Access denied and a missing log answer non-zero, and come back as
+        a reason, so an unread log can never pass for a quiet one.
+        """
+        if not self.windows:
+            return None, "the event log is read on Windows only"
+        try:
+            code, out, err = self._run(
+                [self.wevtutil, "qe", log, "/q:" + query, "/c:%d" % count,
+                 "/rd:true", "/f:xml", "/e:Events"])
+        except Exception as exc:
+            return None, "%s: %s" % (type(exc).__name__, exc)
+        if code != 0:
+            return None, err
+        return out, None
+
+    def time_listdir(self, path, limit=SHARE_LIST_LIMIT):
+        """(elapsed_ms, entries, None) or (None, entries, reason)."""
+        started = time.time()
+        count = 0
+        try:
+            with os.scandir(path) as listing:
+                for _entry in listing:
+                    count += 1
+                    if count >= limit:
+                        break
+        except OSError as exc:
+            return None, count, "%s" % exc
+        return int((time.time() - started) * 1000), count, None
+
+    def read_zip_json(self, path, max_entries=APRX_MAX_ENTRIES,
+                      max_entry=APRX_MAX_ENTRY_BYTES, max_total=APRX_MAX_BYTES):
+        """([(name, text)], truncated, None) or ([], False, reason).
+
+        Only .json entries are read, each and all of them bounded.
+        """
+        import zipfile
+        out = []
+        truncated = False
+        total = 0
+        try:
+            archive = zipfile.ZipFile(path)
+        except (OSError, IOError, zipfile.BadZipfile) as exc:
+            return [], False, "%s" % exc
+        try:
+            for info in archive.infolist():
+                if not info.filename.lower().endswith(".json"):
+                    continue
+                if (len(out) >= max_entries or info.file_size > max_entry
+                        or total + info.file_size > max_total):
+                    truncated = True
+                    continue
+                total += info.file_size
+                out.append((info.filename,
+                            archive.read(info).decode("utf-8", "replace")))
+        finally:
+            archive.close()
+        return out, truncated, None
+
 
 # =============================================================================
 # THE PROBES. Each gathers facts and hands them to its decision function.
@@ -1798,7 +2531,9 @@ def probe_sde_files(env, facts):
 
 
 def probe_pro_running(env, facts):
-    return decide_pro_running(env.processes("ArcGISPro.exe"))
+    processes = env.processes("ArcGISPro.exe")
+    facts["pro_running"] = bool(processes)
+    return decide_pro_running(processes)
 
 
 def probe_protemp(env, facts):
@@ -1954,6 +2689,121 @@ def probe_symbology(env, facts):
     return decide_symbology(cfg(facts.get("settings"), "ManageFeatureCaching"))
 
 
+def probe_nic(env, facts):
+    data, error = env.nic_power()
+    if error is not None:
+        return decide_nic(None, error)
+    return decide_nic([("%s" % r.get("name"), "%s" % r.get("description"),
+                        r.get("state"))
+                       for r in as_list(data) if isinstance(r, dict)], None)
+
+
+def event_queries():
+    """(log, XPath) for the timeline. Filtered by id here, by provider later."""
+    since = ("TimeCreated[timediff(@SystemTime) <= %d]"
+             % (EVENT_WINDOW_DAYS * 86400000))
+    return [
+        ("Application",
+         "*[System[Provider[@Name='Application Error' or "
+         "@Name='Application Hang'] and (EventID=1000 or EventID=1002) and "
+         "%s]]" % since),
+        ("System", "*[System[(EventID=41 or EventID=6008) and %s]]" % since),
+        ("Microsoft-Windows-SMBClient/Connectivity",
+         "*[System[(Level=1 or Level=2 or Level=3) and %s]]" % since),
+    ]
+
+
+def probe_events(env, facts):
+    rows = []
+    unreadable = []
+    capped = []
+    queries = event_queries()
+    for log, query in queries:
+        text, error = env.events(log, query, EVENT_MAX)
+        found = None if error else parse_events(text)
+        if found is None:
+            unreadable.append((log, error or "the reply was not XML"))
+            continue
+        if len(found) >= EVENT_MAX:
+            capped.append(log)
+        for event in found:
+            what = classify_event(log, event)
+            if what:
+                rows.append((event["when"], what))
+    return decide_events(rows, unreadable, len(queries), capped)
+
+
+def probe_smb(env, facts):
+    config, error = env.smb_client()
+    shares = len([1 for _p, _w, cls in (facts.get("recent") or [])
+                  if cls == "NETWORK"])
+    if not isinstance(config, dict):
+        return decide_smb(None, error or "the answer was not a settings "
+                                         "object", shares)
+    return decide_smb(config, None, shares)
+
+
+def probe_share_latency(env, facts):
+    folders = []
+    for path, _when, cls in (facts.get("recent") or []):
+        folder = ntpath.dirname(path)
+        if cls == "NETWORK" and folder not in folders:
+            folders.append(folder)
+    rows = []
+    for folder in folders[:2]:
+        elapsed, entries, error = env.time_listdir(folder)
+        rows.append((folder, elapsed, entries, error))
+    return decide_share_latency(rows)
+
+
+def defender_system_env(env):
+    """The variables Defender sees, as LocalSystem, keyed upper-case."""
+    root = (env.getenv("SystemRoot") or r"C:\Windows").rstrip("\\/")
+    out = {}
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+                 "ALLUSERSPROFILE", "PUBLIC", "SystemDrive", "SystemRoot",
+                 "windir", "CommonProgramFiles"):
+        value = env.getenv(name)
+        if value:
+            out[name.upper()] = value
+    for name, tail in LOCALSYSTEM_PROFILE_VARS.items():
+        out[name] = ntpath.join(root, tail)
+    return out
+
+
+def probe_defender(env, facts):
+    prefs, error = env.defender_preferences()
+    exe = facts.get("pro_exe") or pro_exe_path(env)
+    base = [ntpath.dirname(ntpath.dirname(exe))]
+    for name in ("LOCALAPPDATA", "APPDATA"):
+        value = env.getenv(name)
+        if value:
+            base.append(ntpath.join(value, "ESRI"))
+    if not isinstance(prefs, dict):
+        prefs = None
+        error = error or "the answer was not a settings object"
+    return decide_defender(prefs, error, base, exe, defender_system_env(env))
+
+
+def probe_aprx(env, facts):
+    running = facts.get("pro_running")
+    state = ("unknown" if running is None
+             else "running" if running else "closed")
+    if state != "closed":
+        return decide_aprx(state, [])
+    onedrive = onedrive_roots(env)
+    projects = []
+    for path, _when, _cls in (facts.get("recent") or [])[:APRX_MAX_PROJECTS]:
+        texts, truncated, error = env.read_zip_json(path)
+        if error:
+            projects.append({"path": path, "error": error})
+            continue
+        found = scan_aprx(path, texts, onedrive)
+        found["truncated"] = truncated
+        projects.append(found)
+    return decide_aprx(state, projects)
+
+
 # =============================================================================
 # THE RUN. Order in this list is the order of both reports.
 # =============================================================================
@@ -1974,6 +2824,8 @@ def registrations(env, facts, opts):
          lambda: probe_storage(env, facts)),
         ("DL-03", "ArcGISPro", "Project backup interval", True,
          lambda: probe_backup(env, facts)),
+        ("DL-04", "Network", "Network adapter power management", True,
+         lambda: probe_nic(env, facts)),
         ("DL-06", "Storage", "OneDrive Known Folder Move", True,
          lambda: probe_kfm(env, facts)),
         ("DL-07", "Storage", "Cloud placeholders", True,
@@ -1988,9 +2840,15 @@ def registrations(env, facts, opts):
          lambda: probe_sde_files(env, facts)),
         ("DL-12", "ArcGISPro", "Pro running during the diagnostic", True,
          lambda: probe_pro_running(env, facts)),
+        ("DL-13", "System", "Event timeline", True,
+         lambda: probe_events(env, facts)),
         ("PF-07", "Cache", "Leftover session folders", True,
          lambda: probe_protemp(env, facts)),
 
+        ("PF-02", "Network", "SMB client configuration", False,
+         lambda: probe_smb(env, facts)),
+        ("PF-03", "Network", "Directory listing time on the project share",
+         False, lambda: probe_share_latency(env, facts)),
         ("PF-04", "ArcGISPro", "Pro version and patch level", False,
          lambda: probe_pro_version(env, facts)),
         ("PF-05", "Display", "Rendering and display settings", False,
@@ -2007,8 +2865,12 @@ def registrations(env, facts, opts):
          lambda: probe_disk(env, facts)),
         ("PF-15", "System", "Active power plan", False,
          lambda: probe_power_plan(env, facts)),
+        ("PF-17", "Security", "Microsoft Defender exclusions", False,
+         lambda: probe_defender(env, facts)),
         ("PF-19", "Network", "Portal reachability", False,
          lambda: probe_portal(env, facts, opts)),
+        ("PF-22", "ArcGISPro", "Layer refresh timers from the .aprx", False,
+         lambda: probe_aprx(env, facts)),
         ("PF-26", "System", "Roaming profile", False,
          lambda: probe_roaming(env, facts)),
         ("PF-27", "Display", "Symbology refresh (S4)", False,
@@ -2267,7 +3129,8 @@ class FakeEnv(Env):
     def __init__(self, reg=None, subkeys=None, tree=None, procs=(),
                  mem=(None, None), disks=None, power=(None, None),
                  tcp_map=None, envvars=None, text=None, user="editor",
-                 admin=False, clock=1700000000.0, unreadable=()):
+                 admin=False, clock=1700000000.0, unreadable=(), ps=None,
+                 events=None, listing=None, zips=None):
         self._reg = dict([(_norm(k), v) for k, v in (reg or {}).items()])
         self._subkeys = dict([(_norm(k), v)
                               for k, v in (subkeys or {}).items()])
@@ -2283,6 +3146,11 @@ class FakeEnv(Env):
         self._admin = admin
         self._clock = clock
         self._unreadable = set([_norm(p) for p in unreadable])
+        self._ps = dict(ps or {})
+        self._events = dict(events or {})
+        self._listing = dict([(_norm(k), v) for k, v in (listing or {}).items()])
+        self._zips = dict([(_norm(k), v) for k, v in (zips or {}).items()])
+        self.zip_reads = []
         self.written = []
 
     def now(self):
@@ -2371,6 +3239,35 @@ class FakeEnv(Env):
         return self._tcp.get(host, (False, timeout_ms,
                                     "no answer within %d ms" % timeout_ms))
 
+    def _answer(self, key):
+        return self._ps.get(key, (None, "not available on the stand-in machine"))
+
+    def defender_preferences(self):
+        return self._answer("defender")
+
+    def nic_power(self):
+        return self._answer("nic")
+
+    def smb_client(self):
+        return self._answer("smb")
+
+    def events(self, log, query, count):
+        return self._events.get(log, (None, "no such log on the stand-in "
+                                            "machine"))
+
+    def time_listdir(self, path, limit=SHARE_LIST_LIMIT):
+        return self._listing.get(_norm(path),
+                                 (None, 0, "not reachable on the stand-in "
+                                           "machine"))
+
+    def read_zip_json(self, path, max_entries=APRX_MAX_ENTRIES,
+                      max_entry=APRX_MAX_ENTRY_BYTES, max_total=APRX_MAX_BYTES):
+        self.zip_reads.append(path)
+        found = self._zips.get(_norm(path))
+        if found is None:
+            return [], False, "not a zip on the stand-in machine"
+        return found[0], found[1], None
+
 
 USER_CONFIG_XML = """<?xml version="1.0" encoding="utf-8"?>
 <configuration><userSettings><ArcGIS.Desktop.Settings>
@@ -2390,6 +3287,42 @@ USER_CONFIG_XML = """<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+def event_xml(*events):
+    """A synthetic wevtutil reply. events: (provider, id, when, data, level)."""
+    body = []
+    for provider, eid, when, data, level in events:
+        body.append(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/"
+            "event'><System><Provider Name='%s'/><EventID>%d</EventID>"
+            "<Level>%d</Level><TimeCreated SystemTime='%s.1234567Z'/>"
+            "<Computer>WS-EXAMPLE</Computer></System><EventData>%s"
+            "</EventData></Event>"
+            % (provider, eid, level, when,
+               "".join(["<Data>%s</Data>" % d for d in data])))
+    return "<Events>\r\n%s</Events>\r\n" % "".join(body)
+
+
+QUIET_LOGS = {"Application": (event_xml(), None),
+              "System": (event_xml(), None),
+              "Microsoft-Windows-SMBClient/Connectivity":
+                  (None, "Access is denied.")}
+
+
+def aprx_texts(home, gdb, rate):
+    """The JSON documents inside a synthetic project file."""
+    return [("GISProject.json",
+             json.dumps({"type": "CIMGISProject", "defaultFolder": home,
+                         "defaultGeoDatabase": gdb})),
+            ("Map/map.json",
+             json.dumps({"type": "CIMMapDocument", "layerDefinitions": [
+                 {"type": "CIMFeatureLayer", "name": "Hydrants",
+                  "refreshRate": rate,
+                  "refreshRateUnit": "esriTimeUnitsSeconds"},
+                 {"type": "CIMFeatureLayer", "name": "Streets",
+                  "refreshRate": 0}]})),
+            ("Index/thumbnail.json", "not json at all")]
+
+
 def fake_healthy():
     """A workstation with nothing wrong with it."""
     home = r"C:\Users\editor"
@@ -2401,7 +3334,8 @@ def fake_healthy():
         envvars={"USERPROFILE": home, "APPDATA": home + r"\AppData\Roaming",
                  "LOCALAPPDATA": home + r"\AppData\Local",
                  "TEMP": home + r"\AppData\Local\Temp",
-                 "SystemDrive": "C:"},
+                 "SystemDrive": "C:", "SystemRoot": r"C:\Windows",
+                 "ProgramFiles": r"C:\Program Files"},
         reg={r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders":
                  {"Personal": docs},
              r"HKCU\Software\ESRI\ArcGISPro\Settings":
@@ -2437,7 +3371,22 @@ def fake_healthy():
                                                          "False")},
         mem=(32.0, 12.0),
         disks={"c:\\": (500 * 1024 ** 3, 300 * 1024 ** 3)},
-        power=(HIGH_PERFORMANCE_PLAN, "High performance"))
+        power=(HIGH_PERFORMANCE_PLAN, "High performance"),
+        ps={"defender": ({"DisableRealtimeMonitoring": False,
+                          "HideExclusionsFromLocalAdmins": False,
+                          "ExclusionPath": [r"%ProgramFiles%\ArcGIS\Pro",
+                                            r"C:\Users\*\AppData\Local\ESRI",
+                                            home + "\\AppData\\Roaming\\ESRI\\"],
+                          "ExclusionProcess": ["ArcGISPro.exe"]}, None),
+            "nic": ([{"name": "Ethernet", "description": "Example 1GbE",
+                      "state": "Disabled"}], None),
+            "smb": ({"EnableMultiChannel": True,
+                     "RequireSecuritySignature": False,
+                     "DirectoryCacheLifetime": 10,
+                     "FileInfoCacheLifetime": 10, "SessionTimeout": 60}, None)},
+        events=QUIET_LOGS,
+        zips={projects + r"\Roads.aprx": (aprx_texts(".", "Roads.gdb", 0),
+                                          False)})
 
 
 def fake_sick():
@@ -2452,7 +3401,8 @@ def fake_sick():
     return FakeEnv(
         envvars={"USERPROFILE": home, "APPDATA": home + r"\AppData\Roaming",
                  "LOCALAPPDATA": home + r"\AppData\Local",
-                 "TEMP": temp, "SystemDrive": "C:",
+                 "TEMP": temp, "SystemDrive": "C:", "SystemRoot": r"C:\Windows",
+                 "ProgramFiles": r"C:\Program Files",
                  "OneDrive": home + r"\OneDrive - Example"},
         reg={r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders":
                  {"Personal": docs},
@@ -2509,7 +3459,34 @@ def fake_sick():
         disks={"c:\\": (500 * 1024 ** 3, 5 * 1024 ** 3)},
         power=("381b4222-f694-41f0-9685-ff5bb260df2e", "Balanced"),
         tcp_map={"gisdb": (False, 4000, "no answer within 4000 ms"),
-                 "portal.example.org": (True, 2400, None)})
+                 "portal.example.org": (True, 2400, None)},
+        ps={"defender": ({"DisableRealtimeMonitoring": False,
+                          "ExclusionPath": [r"%APPDATA%\ESRI",
+                                            r"%ProgramFiles%\ArcGIS\Pro"],
+                          "ExclusionProcess": []}, None),
+            "nic": ([{"name": "Wi-Fi", "description": "Example wireless",
+                      "state": "Enabled"},
+                     {"name": "Dock", "description": "Example USB dock",
+                      "state": None}], None),
+            "smb": ({"EnableMultiChannel": False,
+                     "RequireSecuritySignature": True,
+                     "DirectoryCacheLifetime": 10,
+                     "FileInfoCacheLifetime": 10, "SessionTimeout": 60}, None)},
+        events={"Application": (event_xml(
+                    ("Application Hang", 1002, "2026-09-02T14:31:07",
+                     ["ArcGISPro.exe", "3.4.0.55405"], 2),
+                    ("Application Error", 1000, "2026-09-01T09:12:44",
+                     ["python.exe", "3.13.0"], 2),
+                    ("Microsoft-Windows-Winlogon", 1002, "2026-09-01T08:00:00",
+                     [r"C:\Windows\system32\userinit.exe"], 4)), None),
+                "System": (event_xml(
+                    ("Microsoft-Windows-Kernel-Power", 41,
+                     "2026-09-02T14:40:02", ["0"], 1)), None),
+                "Microsoft-Windows-SMBClient/Connectivity": (event_xml(
+                    ("Microsoft-Windows-SMBClient", 30999,
+                     "2026-09-02T14:29:55", [r"\\files\gis"], 3)), None)},
+        zips={projects + r"\Addresses.aprx":
+                  (aprx_texts(".", "Addresses.gdb", 30), False)})
 
 
 def fake_bare():
@@ -3142,6 +4119,320 @@ def self_test():
           "and the impact line says the value was not lost, so a redraw bug is "
           "not escalated as data loss")
 
+    # ----------------------------------------- the causes added in this release
+    print("-" * 70)
+    print("network power, the event timeline, SMB, share latency, Defender "
+          "and the .aprx")
+    check(as_list({"name": "Ethernet"}) == [{"name": "Ethernet"}],
+          "one adapter arrives as a bare object, not a list of one, and is "
+          "read as one adapter rather than as its field names  "
+          "<-- pinned defect")
+    check(as_list(None) == [] and as_list([1, 2]) == [1, 2],
+          "nothing is no adapters, and a list stays a list")
+    check(decide_nic(None, "module missing")["status"] == "Info",
+          "an adapter list that could not be read is Info")
+    check(decide_nic([], None)["status"] == "Info",
+          "no adapter up leaves the power setting undetermined")
+    nic_on = decide_nic([("Wi-Fi", "w", "Enabled"), ("Eth", "e", "Disabled")],
+                        None)
+    check(nic_on["status"] == "Warn" and nic_on["dataloss"] is True,
+          "an adapter Windows may turn off warns, in the data-loss block")
+    check("Wi-Fi" in nic_on["detail"] and "Eth" not in nic_on["detail"],
+          "and the detail names only the adapter to change")
+    check(decide_nic([("Eth", "e", "Disabled"), ("Dock", "d", None)],
+                     None)["status"] == "Info",
+          "one adapter that reads Disabled beside one nobody could read is "
+          "Info, never Pass: a Pass off a partial reading is a verdict about "
+          "a device nobody measured  <-- pinned defect")
+    check(decide_nic([("Eth", "e", "Disabled"), ("Usb", "u", "Unsupported")],
+                     None)["status"] == "Pass",
+          "Disabled and Unsupported on every adapter passes")
+
+    check(parse_events("Access is denied.") is None,
+          "a reply that is not XML is an unread log, not an empty one  "
+          "<-- pinned defect")
+    check(parse_events(event_xml()) == [],
+          "an empty root element is a log with no matching event")
+    parsed = parse_events(event_xml(("Application Hang", 1002,
+                                     "2026-09-02T14:31:07",
+                                     ["ArcGISPro.exe"], 2)))
+    check(parsed == [{"provider": "Application Hang", "id": 1002, "level": 2,
+                      "when": "2026-09-02 14:31:07",
+                      "data": ["ArcGISPro.exe"]}],
+          "an event is read for its provider, id, level, UTC time and data")
+    odd = ("<Events><Event xmlns='http://schemas.microsoft.com/win/2004/08/"
+           "events/event'><EventData/></Event><Event xmlns='http://schemas."
+           "microsoft.com/win/2004/08/events/event'><System><EventID>x"
+           "</EventID></System></Event><Event xmlns='http://schemas.microsoft"
+           ".com/win/2004/08/events/event'><System><EventID>41</EventID>"
+           "<Level></Level></System></Event></Events>")
+    check([e["id"] for e in parse_events(odd)] == [41],
+          "an event with no System block or a non-numeric id is skipped, and "
+          "one with no provider, level or time still reads")
+
+    def ev(provider, eid, data=(), level=4):
+        return {"provider": provider, "id": eid, "level": level, "when": "t",
+                "data": list(data)}
+
+    check(classify_event("Application", ev("Microsoft-Windows-Winlogon", 1002,
+                                           ["ArcGISPro.exe"])) is None,
+          "a Winlogon 1002 is not an Application Hang, even naming the same "
+          "program: the id alone would report a Pro hang on a machine where "
+          "Pro never hung  <-- pinned defect")
+    check(classify_event("Application", ev("Application Error", 1000,
+                                           ["python.exe"])) is None,
+          "another program's crash is not counted")
+    check("crashed" in classify_event(
+              "Application", ev("Application Error", 1000,
+                                [r"C:\Program Files\ArcGIS\Pro\bin"
+                                 r"\ArcGISPro.exe"])),
+          "a Pro crash is matched by the full path of the program too")
+    check("hung" in classify_event("Application", ev("Application Hang", 1002,
+                                                      ["ArcGISPro.exe"])),
+          "a Pro hang is counted")
+    check(classify_event("Application", ev("Application Hang", 1000,
+                                           ["ArcGISPro.exe"])) is None,
+          "a provider and an id that do not belong together are not counted")
+    check("Kernel-Power 41" in classify_event(
+              "System", ev("Microsoft-Windows-Kernel-Power", 41)),
+          "a restart without a clean shutdown is counted")
+    check("6008" in classify_event("System", ev("EventLog", 6008)),
+          "and so is an unexpected previous shutdown")
+    check(classify_event("System", ev("EventLog", 6006)) is None,
+          "a clean shutdown is not")
+    check("uninterpreted" in classify_event(
+              "Microsoft-Windows-SMBClient/Connectivity",
+              ev("Microsoft-Windows-SMBClient", 30999, level=3)),
+          "an SMB connectivity warning is listed with its id uninterpreted, "
+          "because no published reference gives the ids a meaning")
+    check(classify_event("Microsoft-Windows-SMBClient/Connectivity",
+                         ev("Microsoft-Windows-SMBClient", 30999,
+                            level=4)) is None,
+          "and an informational one is not listed")
+
+    found = decide_events([("2026-09-01 10:00:00", "older"),
+                           ("2026-09-02 10:00:00", "newer")], [], 3, [])
+    check(found["status"] == "Warn" and found["dataloss"] is True,
+          "a recorded hang or dirty shutdown warns, in the data-loss block")
+    check(_join(found["observed"]).index("newer")
+          < _join(found["observed"]).index("older"),
+          "and the timeline is newest first")
+    blind_log = decide_events([], [("Application", "Access is denied."),
+                                   ("System", "x"), ("SMB", "y")], 3, [])
+    check(blind_log["status"] == "Info" and "not measured"
+          in _join(blind_log["observed"]),
+          "every log unreadable is Info and says the timeline was not "
+          "measured")
+    quiet = decide_events([], [("SMB", "Access is denied.")], 3, [])
+    check(quiet["status"] == "Info",
+          "no event in the logs that were read is Info, never Pass: a hang "
+          "the editor waits out leaves no event at all  <-- pinned defect")
+    check("SMB: unreadable (Access is denied.)" in _join(quiet["observed"]),
+          "and the log that could not be read is named rather than counted "
+          "as quiet  <-- pinned defect")
+    long_run = decide_events([("2026-09-%02d 00:00:00" % (n % 28 + 1), "e%d" % n)
+                              for n in range(45)], [], 3, ["System"])
+    check("5 more event(s) not listed" in _join(long_run["observed"]),
+          "a long timeline is cut at forty with a count of the rest")
+    check("System: capped at 200 events" in _join(long_run["observed"]),
+          "and a log that hit the event cap says so")
+    garbled = FakeEnv(events={"Application": ("<Events>", None),
+                              "System": (event_xml(), None)})
+    garbled_record = probe_events(garbled, {})
+    check("Application: unreadable (the reply was not XML)"
+          in _join(garbled_record["observed"]),
+          "a reply that does not parse is reported as unreadable by name")
+    flood = FakeEnv(events={"System": (event_xml(*[
+        ("EventLog", 6006, "2026-09-01T00:00:00", [], 4)] * EVENT_MAX),
+        None)})
+    check("System: capped" in _join(probe_events(flood, {})["observed"]),
+          "two hundred events in one log is the cap, so older ones are said "
+          "to be missing rather than absent")
+    check(len([q for _log, q in event_queries()
+               if "timediff(@SystemTime) <= 1209600000" in q]) == 3,
+          "every query is bounded to fourteen days, in milliseconds")
+    check("@Name='Application Hang'" in event_queries()[0][1],
+          "and the Application query names the providers, not only the ids")
+
+    check(decide_smb(None, "denied", 1)["status"] == "Info",
+          "unreadable SMB settings are Info")
+    off = {"EnableMultiChannel": False}
+    check(decide_smb(off, None, 1)["status"] == "Warn",
+          "multichannel off with a project on a share warns")
+    check(decide_smb(off, None, 0)["status"] == "Info",
+          "the same setting with every project local decides nothing")
+    check(decide_smb({"EnableMultiChannel": True}, None, 2)["status"] == "Info",
+          "multichannel on is recorded, not graded")
+    check("SessionTimeout = <absent>" in _join(decide_smb(off, None, 0)
+                                                ["observed"]),
+          "a setting the answer left out prints as absent")
+
+    check(decide_share_latency([])["status"] == "Info",
+          "no project on a share: nothing to time")
+    check(decide_share_latency([("s", 399, 10, None)])["status"] == "Pass",
+          "399 ms passes")
+    check(decide_share_latency([("s", 400, 10, None)])["status"] == "Warn",
+          "400 ms warns: the boundary is inclusive  <-- pinned defect")
+    check(decide_share_latency([("s", 1499, 10, None)])["status"] == "Warn",
+          "1499 ms still only warns")
+    check(decide_share_latency([("s", 1500, 10, None)])["status"] == "Fail",
+          "1500 ms fails")
+    check(decide_share_latency([("s", None, 0, "gone")])["status"] == "Info",
+          "a share that could not be listed is Info, not a latency verdict")
+    mixed = decide_share_latency([("a", None, 0, "gone"),
+                                  ("b", 20, 5, None)])
+    check(mixed["status"] == "Pass" and "unreadable  a" in
+          _join(mixed["observed"]),
+          "one folder timed and one unreadable grades the timed one and names "
+          "the other")
+
+    sentinel = {"DisableRealtimeMonitoring": False,
+                "ExclusionPath": ["N/A: Must be an administrator to view "
+                                  "exclusions"],
+                "ExclusionProcess": ["N/A: Must be an administrator to view "
+                                     "exclusions"]}
+    base = [r"C:\Program Files\ArcGIS\Pro",
+            r"C:\Users\ed\AppData\Local\ESRI",
+            r"C:\Users\ed\AppData\Roaming\ESRI"]
+    exe = r"C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe"
+    sysenv = defender_system_env(FakeEnv(envvars={
+        "SystemRoot": r"C:\Windows", "ProgramFiles": r"C:\Program Files"}))
+    hidden = decide_defender(sentinel, None, base, exe, sysenv)
+    check(hidden["status"] == "Info",
+          "the text an unprivileged read gets in place of the lists is "
+          "recognised as hidden, and decides nothing  <-- pinned defect")
+    check("NOT EXCLUDED" not in _join(hidden["observed"]),
+          "and it is never compared as a path, which reported every baseline "
+          "folder missing on a machine that may exclude them all  "
+          "<-- pinned defect")
+    check(DEFENDER_SENTINEL.search("must be an ADMINISTRATOR to view"),
+          "the sentinel is matched whatever its case")
+    check(decide_defender(None, "cmdlet missing", base, exe,
+                          sysenv)["status"] == "Info",
+          "unreadable Defender preferences are Info")
+    check(decide_defender({"DisableRealtimeMonitoring": True}, None, base, exe,
+                          sysenv)["status"] == "Info",
+          "real-time scanning off makes exclusions decide nothing")
+    check(decide_defender({"HideExclusionsFromLocalAdmins": True,
+                           "ExclusionPath": []}, None, base, exe,
+                          sysenv)["status"] == "Info",
+          "lists hidden by policy are not read as empty  <-- pinned defect")
+    appdata = decide_defender({"ExclusionPath": [r"%APPDATA%\ESRI",
+                                                 r"%LOCALAPPDATA%\ESRI",
+                                                 r"%ProgramFiles%\ArcGIS\Pro"],
+                               "ExclusionProcess": ["ArcGISPro.exe"]},
+                              None, base, exe, sysenv)
+    check(appdata["status"] == "Warn"
+          and "NOT EXCLUDED  path     C:\\Users\\ed\\AppData\\Roaming\\ESRI"
+          in _join(appdata["observed"]),
+          "an exclusion written as %APPDATA% does not cover the editor's "
+          "folder: Defender expands it as LocalSystem, under the system "
+          "profile  <-- pinned defect")
+    check("NOT EXCLUDED  path     C:\\Program Files\\ArcGIS\\Pro"
+          not in _join(appdata["observed"]),
+          "while %ProgramFiles% expands to the same folder for everyone and "
+          "does cover the install")
+    check(defender_expand(r"%NOPE%\x", sysenv) == r"%NOPE%\x",
+          "an unknown variable stays as written, so it matches nothing")
+    check(defender_expand(r"%appdata%\x", sysenv)
+          == r"C:\Windows\System32\config\systemprofile\AppData\Roaming\x",
+          "variable names are matched whatever their case, as Windows does")
+    check(_pattern_covers(r"C:\Users\*\AppData\Local\ESRI",
+                          r"C:\Users\ed\AppData\Local\ESRI\Cache"),
+          "an asterisk stands for one folder, and everything below the match "
+          "is covered")
+    check(not _pattern_covers(r"C:\Users\*\ESRI",
+                              r"C:\Users\ed\AppData\Local\ESRI"),
+          "but it does not stand for three folders  <-- pinned defect")
+    check(_pattern_covers(r"C:\Data\Pro?", r"C:\data\Pro3"),
+          "a question mark is one character, and case does not matter")
+    check(not _pattern_covers(r"C:\Data\Pro\Deep", r"C:\Data\Pro"),
+          "an exclusion below a folder does not cover the folder above it")
+    check(_pattern_covers(r"C:\A\b.c", r"C:\A\b.c\d") and
+          not _pattern_covers(r"C:\A", r"C:\A\b.exe", same_depth=True),
+          "a process exclusion names one file, so a folder path in the "
+          "process list covers nothing")
+
+    def procs_of(entries):
+        return decide_defender({"ExclusionPath": base,
+                                "ExclusionProcess": entries}, None, base, exe,
+                               sysenv)["status"]
+
+    check(procs_of(["arcgispro.EXE"]) == "Pass",
+          "a process excluded by image name covers Pro wherever it runs")
+    check(procs_of([exe]) == "Pass", "and by its full path")
+    check(procs_of([r"C:\Program Files\ArcGIS\Pro\bin\*"]) == "Pass",
+          "and by a wildcard over its folder")
+    check(procs_of([r"C:\Program Files\ArcGIS\Pro"]) == "Warn",
+          "but a folder named as a process is not a process exclusion")
+    check(procs_of(["ArcGISPro.exe"] + [""]) == "Pass",
+          "an empty entry in a list is ignored")
+    contextual = decide_defender({"ExclusionPath": [
+        base[0], base[1], base[2] + r"\:{ScanTrigger:OnDemand}"],
+        "ExclusionProcess": ["ArcGISPro.exe"]}, None, base, exe, sysenv)
+    check(contextual["status"] == "Warn",
+          "a contextual exclusion limited to on-demand scans does not count "
+          "for on-access scanning")
+
+    check(decide_aprx("running", [])["status"] == "Info",
+          "Pro running: the project file is not opened")
+    check("not determined" in decide_aprx("unknown", [])["observed"],
+          "and when nobody knows whether Pro runs, it is not opened either  "
+          "<-- pinned defect")
+    check(decide_aprx("closed", [])["status"] == "Info",
+          "no recent project: nothing to read")
+    share_home = scan_aprx(r"\\files\gis\Roads\Roads.aprx",
+                           aprx_texts(".", ".", 0), [])
+    check(share_home["home"][2] == "NETWORK",
+          "a home folder stored as '.' is resolved against the project "
+          "folder before it is classified, so a project on a share has its "
+          "home on the share, not on no drive at all  <-- pinned defect")
+    check(share_home["home"][1] == r"\\files\gis\Roads",
+          "and the resolved folder is the one the project sits in")
+    check(share_home["parsed"] == 2,
+          "an entry that is not JSON is skipped, and the two that are count")
+    absolute = scan_aprx(r"C:\P\a.aprx", aprx_texts(r"D:\Work", r"D:\Work\w.gdb",
+                                                    0), [])
+    check(absolute["home"][1] == r"D:\Work",
+          "an absolute home folder is kept as written")
+    timed = scan_aprx(r"C:\P\a.aprx", aprx_texts(".", "a.gdb", 30), [])
+    check(len(timed["refresh"]) == 1 and "Hydrants" in timed["refresh"][0],
+          "a layer with a thirty-second refresh is found, and the layer at "
+          "zero is not")
+    check(scan_aprx(r"C:\P\a.aprx", [("x.json", json.dumps(
+        [{"refreshRate": True}, {"refreshRate": -1}]))], [])["refresh"] == [],
+        "a flag or a negative number is not a refresh interval")
+    check(scan_aprx(r"C:\P\a.aprx", [("x.json", "[]")], [])["home"] is None,
+          "a document that is not an object carries no home folder")
+
+    def project(**kw):
+        base_row = {"path": r"C:\P\a.aprx", "home": (".", r"C:\P", "LOCAL"),
+                    "gdb": ("a.gdb", r"C:\P\a.gdb", "LOCAL"), "refresh": [],
+                    "parsed": 2, "truncated": False}
+        base_row.update(kw)
+        return base_row
+
+    check(decide_aprx("closed", [project()])["status"] == "Pass",
+          "a project read in full, local, with no refresh timer passes")
+    check(decide_aprx("closed", [project(refresh=["m: L refreshRate = 30"])])
+          ["status"] == "Warn", "a refresh timer warns")
+    check(decide_aprx("closed", [project(gdb=("g", r"\\s\g", "NETWORK"))])
+          ["status"] == "Warn", "a default geodatabase on a share warns")
+    capped_aprx = decide_aprx("closed", [project(truncated=True)])
+    check(capped_aprx["status"] == "Info",
+          "a project only partly read is Info, never Pass: the timer could be "
+          "in the part the cap left out  <-- pinned defect")
+    check("Not read in full" in capped_aprx["detail"],
+          "and the detail names it")
+    check(decide_aprx("closed", [project(parsed=0)])["status"] == "Info",
+          "a project file with no JSON inside, which is the older layout, is "
+          "unreadable rather than clean")
+    check("<absent>" in _join(decide_aprx("closed",
+                                        [project(home=None)])["observed"]),
+          "a project with no home folder recorded prints it as absent")
+    check(decide_aprx("closed", [{"path": "x", "error": "locked"}])["status"]
+          == "Info", "a project that could not be opened is Info")
+
     # -------------------------------------------------------- the apply gate
     print("-" * 70)
     print("no fix runs off a determination that was never made")
@@ -3189,6 +4480,8 @@ def self_test():
         "PF-06": "Warn", "PF-07": "Warn", "PF-08": "Warn", "PF-11": "Warn",
         "PF-12": "Fail", "PF-13": "Warn", "PF-15": "Warn", "PF-19": "Warn",
         "PF-26": "Warn", "PF-27": "Info",
+        "DL-04": "Warn", "DL-13": "Warn", "PF-02": "Info", "PF-03": "Info",
+        "PF-17": "Warn", "PF-22": "Info",
     }
     for cid in sorted(expected_run):
         check(got.get(cid) == expected_run[cid],
@@ -3250,6 +4543,19 @@ def self_test():
           in by_id(document["checks"], "DL-09")["impact"],
           "of two dumps, only the recent one is counted against the incident: "
           "a dump from last year is history, not evidence about this hang")
+    check(env.zip_reads == [],
+          "with Pro running, not one project file was opened in a whole run  "
+          "<-- pinned defect")
+    check("DL-04" in document["act_first"] and "DL-13" in document["act_first"],
+          "the adapter power setting and the event timeline reach the "
+          "act-first list")
+    timeline = _join(by_id(document["checks"], "DL-13")["observed"])
+    check("Application Hang 1002" in timeline
+          and "userinit" not in timeline and "python" not in timeline,
+          "the timeline lists the Pro hang and leaves out the Winlogon event "
+          "and the other program's crash")
+    check(timeline.index("Kernel-Power 41") < timeline.index("Hang 1002"),
+          "and the dirty shutdown ten minutes after the hang prints above it")
 
     # the settings file, found the second way
     roamed = FakeEnv(
@@ -3415,6 +4721,49 @@ def self_test():
     check(broken_status["DL-12"] == "Pass",
           "the checks after it still ran and still reported")
 
+    class NoProcessTable(FakeEnv):
+        def processes(self, image):
+            raise OSError("the process table could not be listed")
+
+    unsure = fake_healthy()
+    unsure.__class__ = NoProcessTable
+    unsure_run = run(unsure, opts_with())
+    check(by_id(unsure_run["checks"], "DL-12")["status"] == "Skipped"
+          and by_id(unsure_run["checks"], "PF-22")["status"] == "Info"
+          and unsure.zip_reads == [],
+          "when the Pro check itself dies, the project file is not opened: "
+          "not knowing whether Pro runs is not the same as knowing it is "
+          "closed  <-- pinned defect")
+
+    # a profile whose Documents folder lives on a file server
+    unc = fake_healthy()
+    unc_docs = r"\\files\home\editor\Documents"
+    unc_projects = unc_docs + r"\ArcGIS\Projects"
+    unc._reg[_norm(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer"
+                   r"\User Shell Folders")] = {"Personal": unc_docs}
+    for path, children in ((unc_docs, [("ArcGIS", 0, 0, 0, True)]),
+                           (unc_docs + r"\ArcGIS", [("Projects", 0, 0, 0,
+                                                     True)]),
+                           (unc_projects, [("Parcels.aprx", 1000, 1, 0,
+                                            False)])):
+        unc._tree[_norm(path)] = (path, children)
+    unc._listing[_norm(unc_projects)] = (650, 12, None)
+    unc._zips[_norm(unc_projects + r"\Parcels.aprx")] = (
+        aprx_texts(".", ".\\Parcels.gdb", 0), False)
+    unc._ps["smb"] = ({"EnableMultiChannel": False}, None)
+    unc_run = run(unc, opts_with())
+    unc_status = dict([(c["id"], c["status"]) for c in unc_run["checks"]])
+    check(unc_status["PF-03"] == "Warn"
+          and "650 ms" in by_id(unc_run["checks"], "PF-03")["observed"],
+          "a project folder on a share that takes 650 ms to list warns, with "
+          "the number in the report")
+    check(unc_status["PF-02"] == "Warn",
+          "and multichannel off now matters, because a project is on a share")
+    check(unc_status["PF-22"] == "Warn" and "[NETWORK]" in
+          by_id(unc_run["checks"], "PF-22")["observed"],
+          "its default geodatabase, stored as a relative path, is found on the "
+          "share")
+
     # ---------------------------------------------------------- applying, for real
     print("-" * 70)
     print("--apply, against the stand-in machine")
@@ -3425,6 +4774,13 @@ def self_test():
     ids_applied = [r["id"] for r in applied_run["applied"]]
     check(ids_applied == ["AP-01", "AP-02"],
           "with Pro closed and --apply given, both fixes run")
+    check(by_id(applied_run["checks"], "PF-22")["status"] == "Warn"
+          and "Hydrants refreshRate = 30" in
+          by_id(applied_run["checks"], "PF-22")["observed"],
+          "with Pro closed the project file is read, and the layer on a "
+          "thirty-second timer is named")
+    check(len(applying.zip_reads) == 1,
+          "one recent project, one read")
     check(applying._reg[_norm(GPU_PREFERENCE_KEY)][
               r"C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe"]
           == GPU_PREFERENCE_WANTED,
@@ -3720,6 +5076,95 @@ def self_test():
     check((guid is None) == (plan_name is None),
           "and the power plan answers both parts or neither")
 
+    # The same reads with the platform switched off, so both hosts walk the
+    # branch the other one takes.
+    offline = Env()
+    offline.windows = False
+    check(offline.elevated() is False and offline.reg(PRO_REG_KEY, "x") is None
+          and offline.reg_subkeys(PRO_REG_KEY) == []
+          and offline.processes("ArcGISPro.exe") == []
+          and offline.memory() == (None, None)
+          and offline.power_plan() == (None, None),
+          "off Windows every Windows read answers absence, never a guess")
+    check(offline.defender_preferences()[0] is None
+          and offline.nic_power()[1] and offline.smb_client()[1]
+          and offline.events("System", "*", 1)[1],
+          "and the PowerShell and event log reads answer a reason, not an "
+          "empty result")
+    ghost = Env()
+    ghost.windows = True
+    ghost.powershell = "prostall-no-such-program"
+    ghost.wevtutil = "prostall-no-such-program"
+    check(ghost._powershell_json("1")[1] and ghost.events("System", "*",
+                                                          1)[1],
+          "a reader program that is not installed is a reason, not a "
+          "traceback and not an empty answer")
+    check(live.reg_subkeys(r"HKCU\Software\prostall-nothing-here") == [],
+          "a registry key that is not there lists no subkeys")
+
+    data, reason = live._powershell_json("ConvertTo-Json -InputObject @(7)")
+    check((data is None) != (reason is None),
+          "a PowerShell read answers data or a reason, never both and never "
+          "neither")
+    check(live._powershell_json("throw 'prostall'")[1],
+          "a script that throws is a reason, not an empty answer")
+    check(live._powershell_json("Write-Output 'not json'")[1],
+          "and output that is not JSON is a reason too")
+    for name in ("defender_preferences", "nic_power", "smb_client"):
+        data, reason = getattr(live, name)()
+        check((data is None) != (reason is None),
+              "the %s read on this machine answers data or a reason" % name)
+    check(live.events("Prostall-No-Such/Log", "*", 1)[1],
+          "a log that does not exist is an error, not an empty timeline  "
+          "<-- pinned defect")
+    text, reason = live.events("Application", "*[System[EventID=999999]]", 1)
+    check(parse_events(text) == [] if reason is None else bool(reason),
+          "a query nothing matches is an empty list where the log can be "
+          "read, and a reason where it cannot")
+
+    zroot = tempfile.mkdtemp(prefix="prostall-zip-")
+    try:
+        import zipfile
+        good_zip = os.path.join(zroot, "Roads.aprx")
+        archive = zipfile.ZipFile(good_zip, "w")
+        try:
+            for name, body in aprx_texts(".", "Roads.gdb", 30):
+                archive.writestr(name, body)
+            archive.writestr("thumbnail.png", "not read")
+        finally:
+            archive.close()
+        texts, truncated, reason = live.read_zip_json(good_zip)
+        check(len(texts) == 3 and truncated is False and reason is None,
+              "a real project-shaped zip yields its three JSON entries and "
+              "skips the image")
+        check(len(scan_aprx(good_zip, texts, [])["refresh"]) == 1,
+              "and the refresh timer is found in what was read from disk")
+        check(live.read_zip_json(good_zip, max_entries=1)[1] is True,
+              "an entry cap that is reached says the read was capped")
+        check(live.read_zip_json(good_zip, max_entry=1)[:2] == ([], True),
+              "an entry over the size cap is not read, and the read says so")
+        check(live.read_zip_json(good_zip, max_total=1)[1] is True,
+              "and so is one that would take the total past its cap")
+        not_zip = os.path.join(zroot, "old.aprx")
+        handle = io.open(not_zip, "w", encoding="utf-8")
+        handle.write("not a zip")
+        handle.close()
+        check(live.read_zip_json(not_zip)[2],
+              "a project file that is not a zip is a reason, not an empty "
+              "project")
+        for n in range(3):
+            io.open(os.path.join(zroot, "f%d.txt" % n), "w").close()
+        elapsed, entries, reason = live.time_listdir(zroot)
+        check(entries == 5 and elapsed >= 0 and reason is None,
+              "a real folder is listed and timed")
+        check(live.time_listdir(zroot, limit=2)[1] == 2,
+              "and the listing stops at its limit")
+        gone = live.time_listdir(os.path.join(zroot, "nope"))
+        check(gone[0] is None and gone[2],
+              "a folder that cannot be listed has no time, only a reason")
+    finally:
+        shutil.rmtree(zroot, ignore_errors=True)
+
     # --------------------------------------------- the whole tool, on this box
     print("-" * 70)
     print("the tool end to end on the machine running this, read-only")
@@ -3805,8 +5250,10 @@ def _parse(argv):
         description="Diagnose why ArcGIS Pro is slow on this workstation, and "
                     "never report a finding the machine did not produce.",
         epilog="Check by default. Without --apply nothing on the machine "
-               "changes, and without --sde-server or --portal no packet leaves "
-               "it. Connection files are recorded by path and never opened.")
+               "changes, and without --sde-server or --portal no host is "
+               "contacted, apart from reading a project folder that already "
+               "lives on a share. Connection files are recorded by path and "
+               "never opened.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
     ap.add_argument("--verbose", action="store_true",
