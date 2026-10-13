@@ -31,7 +31,8 @@ opens the project, and PF-03 times one listing of it.
     python prostall.py --apply
 
 Exit codes: 0 nothing to act on, 1 performance findings only, 2 at least one
-finding bearing on lost edits, 64 usage error.
+finding bearing on lost edits, 3 no finding but nothing was determined either,
+64 usage error or a report that could not be written.
 """
 
 from __future__ import print_function
@@ -129,6 +130,7 @@ EVENT_MAX = 200
 SHARE_LIST_WARN_MS = 400
 SHARE_LIST_FAIL_MS = 1500
 SHARE_LIST_LIMIT = 500
+SHARE_FOLDERS_TIMED = 2
 
 # The .aprx read is bounded, because a project on a share is exactly where a
 # full read is slow.
@@ -144,7 +146,7 @@ DEFENDER_SENTINEL = re.compile(r"^\s*N/A\s*:|must be an administrator",
                                re.IGNORECASE)
 
 # Defender expands variables in an exclusion as LocalSystem, not as the user.
-# These four resolve under the system profile, so an exclusion written with
+# These five resolve under the system profile, so an exclusion written with
 # one of them never covers the editor's own folder.
 LOCALSYSTEM_PROFILE_VARS = {
     "USERPROFILE": r"System32\config\systemprofile",
@@ -317,12 +319,26 @@ def by_id(checks, cid):
     return None
 
 
+# These two checks can answer Pass on a machine that read nothing else, so a
+# Pass from either one proves nothing about the workstation.
+ALWAYS_ANSWERING = ("DL-00", "DL-12")
+
+
 def exit_code(checks):
-    """0 clean, 1 performance findings only, 2 a finding bearing on lost edits."""
+    """0 clean, 1 performance findings only, 2 a finding bearing on lost edits,
+    3 no finding and nothing was measured either.
+
+    3 exists because a wrapper reading the code cannot see the stderr note. A
+    run that could read nothing (PowerShell blocked, a host that is not
+    Windows) has no finding, and 0 would tell the wrapper the machine is fine.
+    """
     if act_first(checks):
         return 2
     if [c for c in checks if c["status"] in ("Fail", "Warn")]:
         return 1
+    if not [c for c in checks if c["status"] == "Pass"
+            and c["id"] not in ALWAYS_ANSWERING]:
+        return 3
     return 0
 
 
@@ -695,8 +711,8 @@ def decide_placeholders(roots, inspected, placeholders):
     if placeholders:
         return dict(
             cid="DL-07", category="Storage", dataloss=True, status="Warn",
-            title="Project tree contains cloud placeholders or reparse points",
-            observed=(["%d placeholder or reparse item(s) in %d inspected "
+            title="Project tree contains cloud placeholders",
+            observed=(["%d placeholder item(s) in %d inspected "
                        "entries:" % (len(placeholders), inspected)]
                       + list(placeholders[:15])),
             expected="No dehydrated item anywhere Pro reads a project or a "
@@ -800,7 +816,8 @@ def decide_tcp(cid, category, title, host, port, probe, warn_ms, impact, fix,
                dataloss=False):
     """DL-10 and PF-19. One bounded TCP connect, reported honestly.
 
-    probe: None when no host was given, else (open, elapsed_ms, error).
+    probe: None when no host was given, else (open, elapsed_ms, error). open
+    is None when the host name did not resolve.
 
     Connect only. No credential is read, sent or stored, and nothing is written
     to the socket after the handshake.
@@ -814,6 +831,17 @@ def decide_tcp(cid, category, title, host, port, probe, warn_ms, impact, fix,
             expected="A reachable host.", impact="Undetermined.",
             fix="Re-run naming the host to probe.")
     opened, elapsed, error = probe
+    if opened is None:
+        return dict(
+            cid=cid, category=category, dataloss=dataloss, status="Info",
+            measured=False, title=title,
+            observed="%s:%d did not resolve (%s), so the server was not "
+                     "measured this run." % (host, port, error),
+            expected="A host name that resolves.",
+            impact="Undetermined. A name that never resolved says nothing "
+                   "about the server's latency.",
+            fix="Check the spelling of the host name, the DNS suffix and the "
+                "VPN, then re-run.")
     observed = "%s:%d open=%s elapsed=%d ms%s" % (
         host, port, opened, elapsed, (" (%s)" % error) if error else "")
     if not opened:
@@ -877,7 +905,23 @@ def decide_sde_files(paths, index_copies):
 
 
 def decide_pro_running(processes):
-    """DL-12. Pro must be closed before any cache fix, and before a save is safe."""
+    """DL-12. Pro must be closed before any cache fix, and before a save is safe.
+
+    processes: the matching process lines, or None when the process list could
+    not be read. None is not an empty list: an unreadable list reported as a
+    closed Pro opened the project file and let the cache fix run.
+    """
+    if processes is None:
+        return dict(
+            cid="DL-12", category="ArcGISPro", dataloss=True, status="Info",
+            measured=False,
+            title="Whether ArcGIS Pro is running could not be determined",
+            observed="The process list could not be read, so whether Pro is "
+                     "running was not measured this run.",
+            expected="A readable process list.",
+            impact="Blocks the cache fix and the project-file read, because "
+                   "neither is safe while Pro may be running.",
+            fix="Close Pro by hand, then re-run where tasklist can run.")
     if processes:
         return dict(
             cid="DL-12", category="ArcGISPro", dataloss=True, status="Warn",
@@ -1403,6 +1447,11 @@ def decide_nic(adapters, error):
         impact="None.", fix="None.")
 
 
+# The timeline row text that marks an SMB client event. decide_events tells
+# these rows from a Pro hang or a dirty shutdown by this prefix.
+SMB_EVENT_PREFIX = "SMB client connectivity event"
+
+
 def classify_event(log, event):
     """What one event means for the timeline, or None when it is not ours.
 
@@ -1428,8 +1477,8 @@ def classify_event(log, event):
             return "the previous shutdown was unexpected (EventLog 6008)"
         return None
     if event["level"] in (1, 2, 3):
-        return ("SMB client connectivity event %d, level %d, uninterpreted"
-                % (eid, event["level"]))
+        return ("%s %d, level %d, uninterpreted"
+                % (SMB_EVENT_PREFIX, eid, event["level"]))
     return None
 
 
@@ -1483,12 +1532,18 @@ def decide_events(rows, unreadable, queried, capped):
     for log in capped:
         lines.append("%s: capped at %d events, so older ones are not shown"
                      % (log, EVENT_MAX))
+    serious = [r for r in rows if not r[1].startswith(SMB_EVENT_PREFIX)]
     if rows:
         ordered = sorted(rows, reverse=True)
         lines.extend(["%s  %s" % pair for pair in ordered[:40]])
         if len(ordered) > 40:
             lines.append("... %d more event(s) not listed."
                          % (len(ordered) - 40))
+    quiet_note = ("No Pro crash or hang and no dirty shutdown in the logs "
+                  "that were read. That is not a clean bill of health: a hang "
+                  "the editor waits out leaves no event, and the incident may "
+                  "be older than the window.")
+    if serious:
         return dict(
             cid="DL-13", category="System", dataloss=True, status="Warn",
             title="Event timeline: Pro hangs, crashes or dirty shutdowns are "
@@ -1507,6 +1562,21 @@ def decide_events(rows, unreadable, queried, capped):
                    "Hang 1002, naming ArcGISPro.exe); System (Kernel-Power "
                    "41, EventLog 6008); SMB client connectivity warnings and "
                    "errors, ids printed uninterpreted.")
+    if rows:
+        # SMB events alone say nothing about a Pro hang or a crash. A laptop
+        # off the VPN raises them, and a Warn titled "Pro hangs" on that
+        # machine is a verdict the logs did not produce.
+        return dict(
+            cid="DL-13", category="System", dataloss=True, status="Info",
+            title="Event timeline: only SMB client connectivity events in "
+                  "the window",
+            observed=lines + [quiet_note],
+            expected="No ArcGIS Pro crash or hang, and no unexpected "
+                     "shutdown.",
+            impact="S2 and S3. SMB connectivity events can precede a stall "
+                   "on a share, but their ids are not interpreted here.",
+            fix="Lay these times beside the edit she says she lost. If a "
+                "project is on a share, read PF-02 and PF-03 as well.")
     if len(unreadable) == queried:
         return dict(
             cid="DL-13", category="System", dataloss=True, status="Info",
@@ -1518,10 +1588,7 @@ def decide_events(rows, unreadable, queried, capped):
             impact="S2 and S3 undetermined.",
             fix="Read the same events in Event Viewer, or re-run where the "
                 "logs are readable.")
-    lines.append("No Pro crash or hang and no dirty shutdown in the logs that "
-                 "were read. That is not a clean bill of health: a hang the "
-                 "editor waits out leaves no event, and the incident may be "
-                 "older than the window.")
+    lines.append(quiet_note)
     return dict(
         cid="DL-13", category="System", dataloss=True, status="Info",
         title="Event timeline: nothing recorded in the window",
@@ -1567,10 +1634,13 @@ def decide_smb(config, error, share_projects):
             "the desktop or network team. Not auto-fixed.")
 
 
-def decide_share_latency(rows):
+def decide_share_latency(rows, omitted=0):
     """PF-03. One directory listing on the share each remote project uses.
 
-    rows: (folder, elapsed_ms or None, entries, error).
+    rows: (folder, elapsed_ms or None, entries, error). omitted: how many
+    share folders the cap left untimed. A folder that could not be listed
+    keeps a fast reading from becoming a Pass, the same rule DL-04 follows:
+    the unreadable folder is the likely culprit.
     """
     if not rows:
         return dict(
@@ -1587,6 +1657,9 @@ def decide_share_latency(rows):
             continue
         timed.append(elapsed)
         lines.append("%6d ms  %d entries  %s" % (elapsed, entries, folder))
+    if omitted:
+        lines.append("%d more share folder(s) holding a recent project were "
+                     "not timed." % omitted)
     if not timed:
         return dict(
             cid="PF-03", category="Network", status="Info", measured=False,
@@ -1601,6 +1674,16 @@ def decide_share_latency(rows):
         status = "Fail"
     elif worst >= SHARE_LIST_WARN_MS:
         status = "Warn"
+    elif len(timed) < len(rows):
+        return dict(
+            cid="PF-03", category="Network", status="Info", measured=False,
+            title="Directory listing time on the project share",
+            observed=lines + ["At least one share folder could not be listed, "
+                              "so a Pass here would be a guess."],
+            expected="A listable project folder.",
+            impact="S1 undetermined.",
+            fix="Check that every share folder is reachable from this "
+                "session.")
     else:
         status = "Pass"
     return dict(
@@ -1738,7 +1821,7 @@ def decide_defender(prefs, error, base_paths, pro_exe, system_env):
             "Not auto-fixed: exclusions are a security decision.")
 
 
-def scan_aprx(path, texts, onedrive):
+def scan_aprx(path, texts, onedrive, network_drives=()):
     """What one project file says about its home folder and its refresh timers.
 
     texts: (entry name, JSON text) from inside the .aprx. defaultFolder and
@@ -1777,12 +1860,13 @@ def scan_aprx(path, texts, onedrive):
                 raw = doc.get(key)
                 if raw and out[slot] is None:
                     full = ntpath.normpath(ntpath.join(folder, raw))
-                    out[slot] = (raw, full, path_class(full, onedrive))
+                    out[slot] = (raw, full,
+                                 path_class(full, onedrive, network_drives))
         walk(doc, name)
     return out
 
 
-def decide_aprx(pro_state, projects):
+def decide_aprx(pro_state, projects, omitted=0):
     """PF-22. Layer refresh timers and the default geodatabase, from the .aprx.
 
     pro_state: "closed", "running" or "unknown". The read is refused unless
@@ -1792,7 +1876,8 @@ def decide_aprx(pro_state, projects):
     Pro runs refuses it too.
 
     projects: dicts from scan_aprx, or {"path", "error"} for one that could
-    not be opened, each with "truncated".
+    not be opened, each with "truncated". omitted: how many older recent
+    projects the cap left unread.
     """
     title = "Layer refresh timers and default geodatabase (read from the .aprx)"
     if pro_state != "closed":
@@ -1848,6 +1933,8 @@ def decide_aprx(pro_state, projects):
             incomplete.append(p["path"])
             lines.append("   scan capped, so this project was not read in "
                          "full")
+    if omitted:
+        lines.append("%d older recent project(s) were not read." % omitted)
     if hits or remote_gdb:
         status = "Warn"
     elif incomplete:
@@ -1881,10 +1968,10 @@ Entry = collections.namedtuple("Entry", "path name size mtime attrs isdir")
 # stalls on every recall when geodatabase component files carry them.
 FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
-FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+# FILE_ATTRIBUTE_REPARSE_POINT (0x400) is deliberately absent: it marks any
+# junction or symbolic link, and a hydrated placeholder needs no download.
 PLACEHOLDER_ATTRS = (FILE_ATTRIBUTE_RECALL_ON_OPEN
-                     | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-                     | FILE_ATTRIBUTE_REPARSE_POINT)
+                     | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 
 HIVES = ("HKCU", "HKLM", "HKCR", "HKU")
 
@@ -2083,16 +2170,20 @@ class Env(object):
     # -- processes, hardware, network --------------------------------------
 
     def processes(self, image):
-        """Lines describing every running process with this image name."""
+        """Lines describing every running process with this image name.
+
+        None when the list could not be read: off Windows, or tasklist failed.
+        An empty list means tasklist ran and found none.
+        """
         if not self.windows:
-            return []
+            return None
         try:
             import subprocess   # imported here so a plain run never spawns it
             out = subprocess.check_output(
                 ["tasklist", "/FI", "IMAGENAME eq %s" % image, "/NH"],
                 stderr=subprocess.STDOUT)
         except Exception:
-            return []
+            return None
         lines = []
         for line in out.decode("utf-8", "replace").splitlines():
             if line.lower().startswith(image.lower()):
@@ -2152,37 +2243,74 @@ class Env(object):
             return None, None
         return match.group(1), match.group(2).strip()
 
+    def network_drives(self):
+        """Drive letters that are network drives right now, such as ["Z:"].
+
+        GetDriveTypeW answers DRIVE_REMOTE (4) for a mapped drive. Nothing
+        else knows a letter is a share: without this, a project on H: is
+        classified LOCAL.
+        """
+        if not self.windows:
+            return []
+        try:
+            import ctypes
+            kernel = ctypes.windll.kernel32
+            mask = kernel.GetLogicalDrives()
+            return ["%s:" % chr(65 + n) for n in range(26)
+                    if mask & (1 << n)
+                    and kernel.GetDriveTypeW(u"%s:\\" % chr(65 + n)) == 4]
+        except Exception:
+            return []
+
     def tcp(self, host, port, timeout_ms):
         """One bounded TCP connect. Returns (open, elapsed_ms, error).
+
+        open is None, not False, when the name did not resolve: a name that
+        never resolved says nothing about the server, and a Fail on it blamed
+        a host nobody reached. Every address the name resolves to is tried,
+        IPv6 included, inside one shared deadline. The name lookup itself is
+        not bounded by the timeout.
 
         Bounded on purpose. The obvious connect blocks for tens of seconds
         against a dead host, which would dominate the runtime of a diagnostic
         whose whole job is to be run while somebody waits.
         """
         started = time.time()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout_ms / 1000.0)
+        deadline = started + timeout_ms / 1000.0
+
+        def took():
+            return int((time.time() - started) * 1000)
+
         try:
-            sock.connect((host, port))
-            return True, int((time.time() - started) * 1000), None
-        except Exception as exc:
-            return False, int((time.time() - started) * 1000), "%s" % exc
-        finally:
-            sock.close()
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except (socket.gaierror, UnicodeError) as exc:
+            return None, took(), "the name did not resolve: %s" % exc
+        error = "no address"
+        for family, kind, proto, _canon, address in infos:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(max(deadline - time.time(), 0.001))
+            try:
+                sock.connect(address)
+                return True, took(), None
+            except Exception as exc:
+                error = "%s" % exc
+            finally:
+                sock.close()
+        return False, took(), error
 
     # -- read-only PowerShell, event log, share and project reads (1.6) ------
 
     powershell = "powershell.exe"
     wevtutil = "wevtutil"
 
-    def _run(self, argv):
+    def _run(self, argv, timeout=120):
         """(returncode, stdout text, first stderr line) of one bounded child."""
         import subprocess   # imported here so a plain non-Windows run never
                             # spawns anything
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         try:
-            out, err = proc.communicate(timeout=120)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()   # ponytail: a hung child is not reproducible offline
             proc.communicate()
@@ -2382,7 +2510,8 @@ def recent_projects(env, limit=12):
                 out.append((e.path, e.mtime))
     out.sort(key=lambda pair: pair[1], reverse=True)
     onedrive = onedrive_roots(env)
-    return [(path, stamp(when), path_class(path, onedrive))
+    network = env.network_drives()
+    return [(path, stamp(when), path_class(path, onedrive, network))
             for path, when in out[:limit]]
 
 
@@ -2512,6 +2641,7 @@ def probe_sde_files(env, facts):
              ntpath.join(local, "ESRI", "ArcGISPro", "Favorites"),
              ntpath.join(local, "ESRI", "Index", "Connections")]
     onedrive = onedrive_roots(env)
+    network = env.network_drives()
     found = []
     index_copies = 0
     seen = set()
@@ -2523,7 +2653,7 @@ def probe_sde_files(env, facts):
             if e.path in seen:
                 continue
             seen.add(e.path)
-            found.append((e.path, path_class(e.path, onedrive)))
+            found.append((e.path, path_class(e.path, onedrive, network)))
             if "\\index\\connections\\" in e.path.lower().replace("/", "\\"):
                 index_copies += 1
     found.sort()
@@ -2532,7 +2662,7 @@ def probe_sde_files(env, facts):
 
 def probe_pro_running(env, facts):
     processes = env.processes("ArcGISPro.exe")
-    facts["pro_running"] = bool(processes)
+    facts["pro_running"] = None if processes is None else bool(processes)
     return decide_pro_running(processes)
 
 
@@ -2750,10 +2880,11 @@ def probe_share_latency(env, facts):
         if cls == "NETWORK" and folder not in folders:
             folders.append(folder)
     rows = []
-    for folder in folders[:2]:
+    for folder in folders[:SHARE_FOLDERS_TIMED]:
         elapsed, entries, error = env.time_listdir(folder)
         rows.append((folder, elapsed, entries, error))
-    return decide_share_latency(rows)
+    return decide_share_latency(rows,
+                                max(len(folders) - SHARE_FOLDERS_TIMED, 0))
 
 
 def defender_system_env(env):
@@ -2792,16 +2923,18 @@ def probe_aprx(env, facts):
     if state != "closed":
         return decide_aprx(state, [])
     onedrive = onedrive_roots(env)
+    network = env.network_drives()
+    recent = facts.get("recent") or []
     projects = []
-    for path, _when, _cls in (facts.get("recent") or [])[:APRX_MAX_PROJECTS]:
+    for path, _when, _cls in recent[:APRX_MAX_PROJECTS]:
         texts, truncated, error = env.read_zip_json(path)
         if error:
             projects.append({"path": path, "error": error})
             continue
-        found = scan_aprx(path, texts, onedrive)
+        found = scan_aprx(path, texts, onedrive, network)
         found["truncated"] = truncated
         projects.append(found)
-    return decide_aprx(state, projects)
+    return decide_aprx(state, projects, max(len(recent) - APRX_MAX_PROJECTS, 0))
 
 
 # =============================================================================
@@ -2908,6 +3041,9 @@ def apply_gate(checks, target, per_user):
     if check["status"] == "Skipped":
         return False, ("%s was skipped, so nothing about it was determined and "
                        "no fix may run off that record" % target)
+    if check["status"] == "Info":
+        return False, ("%s was read but not determined (Info), so there is "
+                       "nothing known to fix" % target)
     if check["status"] not in ("Fail", "Warn"):
         return False, "%s is already healthy (%s)" % (target, check["status"])
     if per_user:
@@ -2978,7 +3114,7 @@ def apply_fixes(checks, env, facts, do_apply):
             continue
         if blocker:
             blocking = by_id(checks, blocker)
-            if blocking is not None and blocking["status"] in ("Fail", "Warn"):
+            if blocking is not None and blocking["status"] != "Pass":
                 notes.append("refused [%s] %s: %s"
                              % (cid, blocker, blocking["title"]))
                 continue
@@ -3130,13 +3266,13 @@ class FakeEnv(Env):
                  mem=(None, None), disks=None, power=(None, None),
                  tcp_map=None, envvars=None, text=None, user="editor",
                  admin=False, clock=1700000000.0, unreadable=(), ps=None,
-                 events=None, listing=None, zips=None):
+                 events=None, listing=None, zips=None, netdrives=()):
         self._reg = dict([(_norm(k), v) for k, v in (reg or {}).items()])
         self._subkeys = dict([(_norm(k), v)
                               for k, v in (subkeys or {}).items()])
         self._tree = dict([(_norm(k), (k, v)) for k, v in (tree or {}).items()])
         self._text = dict([(_norm(k), v) for k, v in (text or {}).items()])
-        self._procs = list(procs)
+        self._procs = None if procs is None else list(procs)
         self._mem = mem
         self._disks = dict([(_norm(k), v) for k, v in (disks or {}).items()])
         self._power = power
@@ -3150,6 +3286,7 @@ class FakeEnv(Env):
         self._events = dict(events or {})
         self._listing = dict([(_norm(k), v) for k, v in (listing or {}).items()])
         self._zips = dict([(_norm(k), v) for k, v in (zips or {}).items()])
+        self._netdrives = list(netdrives)
         self.zip_reads = []
         self.written = []
 
@@ -3223,7 +3360,12 @@ class FakeEnv(Env):
         self._tree[_norm(dst)] = (dst, self._tree.pop(key)[1])
         self.written.append(("rename", src, dst))
 
+    def network_drives(self):
+        return list(self._netdrives)
+
     def processes(self, image):
+        if self._procs is None:
+            return None
         return list(self._procs) if image.lower() == "arcgispro.exe" else []
 
     def memory(self):
@@ -3504,6 +3646,15 @@ def opts_with(**kwargs):
     return merged
 
 
+def summarize(passed, failed):
+    """The self-test footer as (lines, exit code)."""
+    total = passed + len(failed)
+    if failed:
+        return (["%d assertions, %d failed" % (total, len(failed))]
+                + ["  FAILED: %s" % item for item in failed]), 1
+    return ["%d assertions, 0 failed" % total], 0
+
+
 def self_test():
     """Assertions over the whole diagnostic. No registry, no socket, no disk."""
     import io
@@ -3708,9 +3859,20 @@ def self_test():
     check(exit_code(sample) == 2, "a data-loss finding exits 2")
     check(exit_code([sample[5]]) == 1, "a performance finding alone exits 1")
     check(exit_code([sample[2]]) == 0, "a clean run exits 0")
-    check(exit_code([sample[4]]) == 0,
-          "a run whose only record is Skipped exits 0: undetermined is not a "
-          "finding, and the summary says so on its own line")
+    check(exit_code([sample[4]]) == 3,
+          "a run whose only record is Skipped exits 3, not 0: a wrapper "
+          "reading the code cannot see the stderr note, and 0 told it the "
+          "machine was fine when nothing was read  <-- pinned defect")
+    check(exit_code([]) == 3, "and so does a run with no record at all")
+    always = [make_check("DL-00", "c", "t", "Pass", "measured", dataloss=True),
+              make_check("DL-12", "c", "t", "Pass", "measured", dataloss=True)]
+    check(exit_code(always) == 3,
+          "the two checks that answer on a machine that read nothing else do "
+          "not make a run determined  <-- pinned defect")
+    check(exit_code(always + [sample[2]]) == 0,
+          "one more Pass from any other check does")
+    check(exit_code(always + [sample[5]]) == 1,
+          "and a finding outranks the undetermined code")
 
     # --------------------------------------------------------- path handling
     print("-" * 70)
@@ -4281,10 +4443,19 @@ def self_test():
           "a share that could not be listed is Info, not a latency verdict")
     mixed = decide_share_latency([("a", None, 0, "gone"),
                                   ("b", 20, 5, None)])
-    check(mixed["status"] == "Pass" and "unreadable  a" in
-          _join(mixed["observed"]),
-          "one folder timed and one unreadable grades the timed one and names "
-          "the other")
+    check(mixed["status"] == "Info" and "unreadable  a" in
+          _join(mixed["observed"]) and mixed["measured"] is False,
+          "one folder timed fast and one unreadable is Info, never Pass, and "
+          "names the unreadable one: the folder nobody could list is the "
+          "likely culprit, and DL-04 refuses the same partial reading  "
+          "<-- pinned defect")
+    check(make_check(**mixed)["status"] == "Info",
+          "and the record constructor accepts it")
+    slow_mixed = decide_share_latency([("a", None, 0, "gone"),
+                                       ("b", 450, 5, None)])
+    check(slow_mixed["status"] == "Warn",
+          "a slow folder beside an unreadable one still warns: that part was "
+          "measured")
 
     sentinel = {"DisableRealtimeMonitoring": False,
                 "ExclusionPath": ["N/A: Must be an administrator to view "
@@ -4924,14 +5095,36 @@ def self_test():
               "<-- pinned defect")
     finally:
         globals()["self_test"] = real_self_test
-    def quiet_main(argv):
-        """main with its usage errors captured, so they do not land here."""
-        real_stderr = sys.stderr
-        sys.stderr = io.StringIO()
+    def run_main(argv):
+        """main with stdout and stderr captured: (code, stdout, stderr).
+
+        Stdout is captured too, because a run that fails to write its report
+        has already printed it, and that report names this machine's user and
+        project paths. A self-test must not print those.
+        """
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
         try:
-            return main(argv), sys.stderr.getvalue()
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = exc.code
+            return code, sys.stdout.getvalue(), sys.stderr.getvalue()
         finally:
-            sys.stderr = real_stderr
+            sys.stdout, sys.stderr = real_out, real_err
+
+    def quiet_main(argv):
+        code, _out, err = run_main(argv)
+        return code, err
+
+    def with_env(factory, argv):
+        """run_main with the machine the tool reads swapped for a stand-in."""
+        real_env = globals()["Env"]
+        globals()["Env"] = factory
+        try:
+            return run_main(argv)
+        finally:
+            globals()["Env"] = real_env
 
     code, message = quiet_main(["--timeout", "0"])
     check(code == 64, "a zero timeout is a usage error")
@@ -5066,8 +5259,10 @@ def self_test():
           "and a subkey read always answers a list")
     check(live.reg("NOTAHIVE\\x", "y") is None,
           "a path with no real hive is absence, not a crash")
-    check(isinstance(live.processes("ArcGISPro.exe"), list),
-          "the process question always answers a list")
+    check(isinstance(live.processes("ArcGISPro.exe"), list)
+          or live.processes("ArcGISPro.exe") is None,
+          "the process question answers a list, or None when it could not be "
+          "asked")
     total_gb, free_gb = live.memory()
     check((total_gb is None) == (free_gb is None),
           "memory answers both numbers or neither, so no check can compute a "
@@ -5082,7 +5277,8 @@ def self_test():
     offline.windows = False
     check(offline.elevated() is False and offline.reg(PRO_REG_KEY, "x") is None
           and offline.reg_subkeys(PRO_REG_KEY) == []
-          and offline.processes("ArcGISPro.exe") == []
+          and offline.processes("ArcGISPro.exe") is None
+          and offline.network_drives() == []
           and offline.memory() == (None, None)
           and offline.power_plan() == (None, None),
           "off Windows every Windows read answers absence, never a guess")
@@ -5169,8 +5365,9 @@ def self_test():
     print("-" * 70)
     print("the tool end to end on the machine running this, read-only")
     code, printed = captured(lambda: main(["--json"]))
-    check(code in (0, 1, 2),
-          "a real run exits 0, 1 or 2, whatever this machine turns out to be")
+    check(code in (0, 1, 2, 3),
+          "a real run exits 0, 1, 2 or 3, whatever this machine turns out to "
+          "be")
     live_document = json.loads(printed)
     check(live_document["prostall"] == 1,
           "the JSON it prints carries report version 1, the number a diff "
@@ -5204,6 +5401,678 @@ def self_test():
     finally:
         shutil.rmtree(report_dir, ignore_errors=True)
 
+    # ---------------------------------------- what the first review round found
+    print("-" * 70)
+    print("a verdict needs a measurement: the first review round")
+    import ctypes
+    import runpy
+    import subprocess
+    import types
+
+    # A usage error is 64. argparse exits 2, and 2 means lost edits.
+    for argv in (["--ap"], ["--bogus"], ["--timeout", "abc"],
+                 ["--sde-port", "x"]):
+        code, _out, err = run_main(argv)
+        check(code == 64 and "usage" in err,
+              "%s is a usage error, exit 64 and never the lost-edits code 2  "
+              "<-- pinned defect" % " ".join(argv))
+    check(run_main(["--help"])[0] == 0, "and --help still exits 0")
+
+    # A host name is a host name.
+    check(host_problem("gisdb01") is None
+          and host_problem("gis.example.org") is None
+          and host_problem("::1") is None,
+          "a plain name, a dotted name and an IPv6 literal are hosts")
+    for bad in ("https://gis.example.org/portal", "gis.example.org/portal",
+                "gis example", "user@host", "", "   "):
+        check(host_problem(bad),
+              "%r is not a host name  <-- pinned defect" % bad)
+    code, _out, err = run_main(["--portal", "https://gis.example.org/portal"])
+    check(code == 64 and "--portal" in err,
+          "a URL pasted as a host is refused with exit 64, and the message "
+          "names the flag, rather than probed and reported as a failure")
+    check(run_main(["--sde-server", ""])[0] == 64,
+          "so is an empty host name")
+
+    # A name that never resolved says nothing about the server.
+    real_getaddrinfo = socket.getaddrinfo
+
+    def no_such_name(*args, **kwargs):
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    socket.getaddrinfo = no_such_name
+    try:
+        unresolved = live.tcp("gisdb01", 1433, 1000)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+    check(unresolved[0] is None and "did not resolve" in unresolved[2],
+          "a host name that does not resolve is open=None with the reason, "
+          "not open=False  <-- pinned defect")
+    check(live.tcp("a" * 70 + ".example", 1433, 1000)[0] is None,
+          "and so is a name no resolver can encode")
+    gone_host = decide_tcp("DL-10", "Network", "t", "gisdb01", 1433,
+                           (None, 3, "the name did not resolve: x"), 250, "i",
+                           "f", dataloss=True)
+    check(gone_host["status"] == "Info" and gone_host["measured"] is False
+          and make_check(**gone_host)["status"] == "Info",
+          "an unresolved name is Info and unmeasured: DL-10 is a data-loss "
+          "check, and a Fail on a typo blamed a server nobody reached  "
+          "<-- pinned defect")
+    check(act_first([make_check(**gone_host)]) == [],
+          "so it never reaches the act-first list")
+    typo = fake_healthy()
+    typo._tcp["gisdb"] = (None, 5, "the name did not resolve: x")
+    typo_run = run(typo, opts_with(sde_server="gisdb"))
+    check(by_id(typo_run["checks"], "DL-10")["status"] == "Info"
+          and "DL-10" not in typo_run["act_first"]
+          and exit_code(typo_run["checks"]) == 0,
+          "in a whole run the unresolved name leaves the exit code alone")
+    refused = decide_tcp("DL-10", "Network", "t", "h", 1433,
+                         (False, 5, "refused"), 250, "i", "f")
+    check(refused["status"] == "Fail",
+          "while a host that resolved and refused the connection still fails")
+
+    # Every address a name resolves to is tried, inside one deadline.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    good_port = listener.getsockname()[1]
+
+    def two_addresses(*args, **kwargs):
+        # Port 0 refuses at once on both hosts, so the shared deadline is not
+        # spent on the first address.
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 ("127.0.0.1", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 ("127.0.0.1", good_port))]
+
+    socket.getaddrinfo = two_addresses
+    try:
+        second = live.tcp("twoaddresses.example", good_port, 3000)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+        listener.close()
+    check(second[0] is True,
+          "a name with two addresses is tried on both: the first one "
+          "refusing does not end the probe")
+
+    def listen_on(family, address):
+        """A listening socket, or None where the host cannot bind it."""
+        sock = None
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.bind(address)
+            sock.listen(1)
+        except OSError:
+            sock is None or sock.close()
+            return None
+        return sock
+
+    check(listen_on(socket.AF_INET, ("::1", 0)) is None,
+          "a listener that cannot bind answers None")
+    six = listen_on(socket.AF_INET6, ("::1", 0))
+    six_open = (six is not None
+                and live.tcp("::1", six.getsockname()[1], 2000)[0])
+    six is None or six.close()
+    check(six is None or six_open is True,
+          "an IPv6 literal is probed where this host has an IPv6 loopback, "
+          "and the check is vacuous where it has none")
+
+    # DL-12: a process list nobody could read is not a closed Pro.
+    winenv = Env()
+    winenv.windows = True
+    real_check_output = subprocess.check_output
+
+    def tasklist_says(out):
+        def fake(*args, **kwargs):
+            return out
+        return fake
+
+    def tasklist_fails(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "tasklist")
+
+    try:
+        subprocess.check_output = tasklist_says(
+            b"ArcGISPro.exe     9120 Console    1  2,100,480 K\r\n"
+            b"other.exe 7 Console 1 10 K\r\n")
+        running = winenv.processes("ArcGISPro.exe")
+        subprocess.check_output = tasklist_says(
+            b"INFO: No tasks are running which match the specified "
+            b"criteria.\r\n")
+        none_running = winenv.processes("ArcGISPro.exe")
+        subprocess.check_output = tasklist_fails
+        unreadable_list = winenv.processes("ArcGISPro.exe")
+        subprocess.check_output = tasklist_says(
+            b"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  "
+            b"(Balanced)\r\n")
+        plan_read = winenv.power_plan()
+        subprocess.check_output = tasklist_says(b"nothing useful\r\n")
+        plan_unparsed = winenv.power_plan()
+        subprocess.check_output = tasklist_fails
+        plan_failed = winenv.power_plan()
+    finally:
+        subprocess.check_output = real_check_output
+    check(running == ["ArcGISPro.exe 9120 Console 1 2,100,480 K"],
+          "a tasklist line for a running Pro is read, and the other "
+          "process is not")
+    check(none_running == [],
+          "and tasklist finding none is an empty list: Pro is closed")
+    check(unreadable_list is None,
+          "while tasklist failing is None, not an empty list  "
+          "<-- pinned defect")
+    check(plan_read == ("381b4222-f694-41f0-9685-ff5bb260df2e", "Balanced"),
+          "the active power scheme is read from powercfg")
+    check(plan_unparsed == (None, None) and plan_failed == (None, None),
+          "and a powercfg answer that is not a scheme, or that failed, is "
+          "unread")
+    unknown = decide_pro_running(None)
+    check(unknown["status"] == "Info" and unknown["measured"] is False
+          and unknown["dataloss"] is True
+          and make_check(**unknown)["status"] == "Info",
+          "an unreadable process list makes DL-12 Info and unmeasured  "
+          "<-- pinned defect")
+    unknown_pro = fake_sick()
+    unknown_pro._procs = None
+    unknown_run = run(unknown_pro, opts_with(apply=True))
+    check(by_id(unknown_run["checks"], "DL-12")["status"] == "Info"
+          and "DL-12" not in unknown_run["act_first"],
+          "in a whole run the unreadable list is Info and not an act-first "
+          "finding")
+    check(unknown_pro.zip_reads == []
+          and by_id(unknown_run["checks"], "PF-22")["status"] == "Info",
+          "and no project file is opened off a Pro nobody could see  "
+          "<-- pinned defect")
+    check([r["id"] for r in unknown_run["applied"]] == ["AP-02"]
+          and [n for n in unknown_run["notes"]
+               if n.startswith("refused [AP-01]")],
+          "and the cache fix is refused by name, because only a Pass from "
+          "DL-12 lets it run  <-- pinned defect")
+    check(unknown_pro.isdir(r"C:\Users\editor\AppData\Local\ESRI"
+                            r"\Local Caches"),
+          "the cache folder was not renamed")
+    gated_info = [make_check("PF-08", "c", "t", "Info", "read")]
+    allowed, why = apply_gate(gated_info, "PF-08", False)
+    check(allowed is False and "healthy" not in why and "Info" in why,
+          "a check that is Info is not called already healthy: only a Pass "
+          "is  <-- pinned defect")
+
+    # DL-13: SMB events alone are not a Pro hang.
+    smb_row = ("2026-09-02 14:29:55",
+               "SMB client connectivity event 30999, level 3, uninterpreted")
+    pro_row = ("2026-09-02 14:31:07",
+               "ArcGIS Pro hung and was ended (Application Hang 1002)")
+    smb_only = decide_events([smb_row], [], 3, [])
+    check(smb_only["status"] == "Info" and smb_only["dataloss"] is True
+          and "Pro hangs" not in smb_only["title"]
+          and act_first([make_check(**smb_only)]) == [],
+          "an SMB-only timeline is Info and stays out of the act-first "
+          "list: its Warn said Pro hangs on a laptop that was off the VPN  "
+          "<-- pinned defect")
+    check("SMB client connectivity event 30999" in _join(smb_only["observed"]),
+          "and the SMB event is still listed")
+    check(decide_events([smb_row, pro_row], [], 3, [])["status"] == "Warn",
+          "an SMB event beside a Pro hang still warns")
+    smb_env = fake_sick()
+    smb_env._events = {
+        "Application": (event_xml(), None), "System": (event_xml(), None),
+        "Microsoft-Windows-SMBClient/Connectivity": (event_xml(
+            ("Microsoft-Windows-SMBClient", 30999, "2026-09-02T14:29:55",
+             [r"\\files\gis"], 3)), None)}
+    smb_run = run(smb_env, opts_with())
+    check(by_id(smb_run["checks"], "DL-13")["status"] == "Info"
+          and "DL-13" not in smb_run["act_first"],
+          "in a whole run an SMB-only log leaves DL-13 out of the act-first "
+          "list")
+    forty = [("2026-09-01 00:%02d:00" % n, "e%d" % n) for n in range(40)]
+    check("more event(s)" not in
+          _join(decide_events(forty, [], 3, [])["observed"]),
+          "exactly forty events list with no remainder line")
+    check("1 more event(s) not listed" in _join(decide_events(
+        forty + [("2026-09-02 00:00:00", "e40")], [], 3, [])["observed"]),
+        "and forty-one list forty and count one")
+    smb_log = "Microsoft-Windows-SMBClient/Connectivity"
+    for level, listed in ((0, False), (1, True), (2, True), (3, True),
+                          (4, False), (5, False)):
+        check((classify_event(smb_log, ev("Microsoft-Windows-SMBClient",
+                                          30999, level=level))
+               is not None) is listed,
+              "an SMB event at level %d is %s" % (level, "listed" if listed
+                                                  else "left out"))
+    check(classify_event("System", ev("Some-Other-Provider", 41)) is None
+          and classify_event("System",
+                             ev("Microsoft-Windows-Kernel-Power", 42)) is None
+          and classify_event("System", ev("EventLog", 41)) is None
+          and classify_event("System", ev("Some-Other-Provider", 6008))
+          is None,
+          "a restart or shutdown event is matched on the provider as well as "
+          "the id, in both directions  <-- pinned defect")
+
+    # PF-03: a partial reading is not a Pass, and the cap is stated.
+    shares = [(r"\\files\g%d\p.aprx" % n, "t", "NETWORK") for n in range(4)]
+    share_env = FakeEnv(listing={r"\\files\g0": (40, 3, None),
+                                 r"\\files\g1": (60, 3, None)})
+    share_record = probe_share_latency(share_env, {"recent": shares})
+    check(share_record["status"] == "Pass"
+          and "2 more share folder(s)" in _join(share_record["observed"]),
+          "four share folders, two timed: the report says two were not  "
+          "<-- pinned defect")
+    half_env = FakeEnv(listing={r"\\files\g0": (40, 3, None)})
+    check(probe_share_latency(half_env, {"recent": shares})["status"]
+          == "Info",
+          "and in a probe, one folder fast and the next unreachable is Info")
+    nothing_listed = decide_share_latency([("a", None, 0, "path not found")])
+    check("path not found" in _join(nothing_listed["observed"])
+          and "not measured" in _join(nothing_listed["observed"]),
+          "a share nobody could list names the reason and says it was not "
+          "measured")
+
+    # PF-22: the cap is stated, and unreadable text names its cause.
+    many = fake_healthy()
+    many_recent = [(r"C:\Users\editor\Documents\ArcGIS\Projects\P%d.aprx" % n,
+                    "t", "LOCAL") for n in range(8)]
+    many_record = probe_aprx(many, {"pro_running": False,
+                                    "recent": many_recent})
+    check(len(many.zip_reads) == APRX_MAX_PROJECTS
+          and "5 older recent project(s) were not read"
+          in _join(many_record["observed"]),
+          "eight recent projects, three read: the report says five were not  "
+          "<-- pinned defect")
+    check("no JSON document" in _join(decide_aprx(
+        "closed", [project(parsed=0)])["observed"])
+        and "locked" in _join(decide_aprx(
+            "closed", [{"path": "x", "error": "locked"}])["observed"]),
+        "a project with no JSON and one that could not be opened each name "
+        "their own cause")
+    first_doc = scan_aprx(r"C:\P\a.aprx", [
+        ("a.json", json.dumps({"defaultFolder": r"C:\One"})),
+        ("b.json", json.dumps({"defaultFolder": r"C:\Two"}))], [])
+    check(first_doc["home"][1] == r"C:\One",
+          "when two documents name a home folder, the first one wins")
+
+    # Mapped drives were never classified: no caller supplied them.
+    check(scan_aprx(r"C:\P\a.aprx", aprx_texts(".", r"Z:\g.gdb", 0), [],
+                    ["Z:"])["gdb"][2] == "NETWORK"
+          and scan_aprx(r"C:\P\a.aprx", aprx_texts(".", r"Z:\g.gdb", 0),
+                        [])["gdb"][2] == "LOCAL",
+          "a default geodatabase on a mapped drive is a share once the drive "
+          "letters are supplied, and local when they are not")
+
+    class _MappedKernel(object):
+        def GetLogicalDrives(self):
+            return (1 << 2) | (1 << 25)
+
+        def GetDriveTypeW(self, root):
+            return 4 if root.startswith("Z") else 3
+
+    class _BrokenWindll(object):
+        @property
+        def kernel32(self):
+            raise OSError("no kernel32")
+
+        @property
+        def shell32(self):
+            raise OSError("no shell32")
+
+    absent = object()
+
+    def with_windll(fake, fn):
+        """fn() with ctypes.windll replaced, then put back exactly as it was.
+
+        ctypes has no windll off Windows, so the restore removes the name
+        when there was none. Written without a branch so both hosts run the
+        same lines.
+        """
+        saved = vars(ctypes).get("windll", absent)
+        ctypes.windll = fake
+        try:
+            return fn()
+        finally:
+            vars(ctypes).pop("windll", None)
+            vars(ctypes).update(
+                dict([("windll", saved)][:int(saved is not absent)]))
+
+    check(with_windll(types.SimpleNamespace(kernel32=_MappedKernel()),
+                      winenv.network_drives) == ["Z:"],
+          "GetDriveTypeW answering DRIVE_REMOTE (4) makes a drive letter a "
+          "network drive, and a fixed drive is left out  <-- pinned defect")
+    check(with_windll(_BrokenWindll(), winenv.network_drives) == [],
+          "a drive query that fails is no drives")
+    check(isinstance(live.network_drives(), list),
+          "and the real query answers a list on either platform")
+    mapped = fake_healthy()
+    mapped._netdrives = ["H:"]
+    shell_key = (r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer"
+                 r"\User Shell Folders")
+    mapped._reg[_norm(shell_key)] = {"Personal": r"H:\Docs"}
+    for path, children in ((r"H:\Docs", [("ArcGIS", 0, 0, 0, True)]),
+                           (r"H:\Docs\ArcGIS", [("Projects", 0, 0, 0, True)]),
+                           (r"H:\Docs\ArcGIS\Projects",
+                            [("Maps.aprx", 1000, 1, 0, False)])):
+        mapped._tree[_norm(path)] = (path, children)
+    mapped._listing[_norm(r"H:\Docs\ArcGIS\Projects")] = (900, 4, None)
+    mapped_run = run(mapped, opts_with())
+    check("NETWORK" in by_id(mapped_run["checks"], "DL-05")["observed"]
+          and by_id(mapped_run["checks"], "DL-05")["status"] == "Fail",
+          "a project folder on a mapped drive is a share: DL-05 fails it  "
+          "<-- pinned defect")
+    check("900 ms" in by_id(mapped_run["checks"], "PF-03")["observed"],
+          "and PF-03 times its listing")
+
+    # DL-07: a junction is not a dehydrated file.
+    check(not (0x400 & PLACEHOLDER_ATTRS)
+          and FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS & PLACEHOLDER_ATTRS
+          and FILE_ATTRIBUTE_RECALL_ON_OPEN & PLACEHOLDER_ATTRS,
+          "the recall bits mark a placeholder and the reparse-point bit does "
+          "not  <-- pinned defect")
+    linked = fake_healthy()
+    linked._tree[_norm(r"C:\Users\editor\Documents\ArcGIS\Projects")][1].append(
+        ("Link", 0, 1, 0x400, True))
+    check(probe_placeholders(linked, {})["status"] == "Pass",
+          "a junction under the project tree is not counted as a placeholder")
+
+    # Defender: the controls the mutation sweep found unpinned.
+    no_hide = decide_defender({"HideExclusionsFromLocalAdmins": False,
+                               "ExclusionPath": [], "ExclusionProcess": []},
+                              None, base, exe, sysenv)
+    check(no_hide["status"] == "Warn" and "hidden" not in no_hide["title"],
+          "no exclusions with the hide policy off is a finding, not 'hidden "
+          "by policy'  <-- pinned defect")
+    shown = decide_defender({"HideExclusionsFromLocalAdmins": True,
+                             "ExclusionPath": base,
+                             "ExclusionProcess": ["ArcGISPro.exe"]},
+                            None, base, exe, sysenv)
+    check(shown["status"] == "Pass",
+          "and the hide policy on with lists that came back is read normally")
+    check(procs_of(["other.exe"]) == "Warn"
+          and procs_of([r"D:\Other\ArcGISPro.exe"]) == "Warn",
+          "another program, and Pro at another path, are not a process "
+          "exclusion for this Pro  <-- pinned defect")
+    crowd = decide_defender(
+        {"ExclusionPath": [r"C:\Data\p%d" % n for n in range(25)],
+         "ExclusionProcess": ["tool%d.exe" % n for n in range(25)]},
+        None, base, exe, sysenv)
+    crowd_lines = _join(crowd["observed"]).split("\n")
+    check(len([l for l in crowd_lines if l.startswith("  path     ")]) == 20
+          and len([l for l in crowd_lines if l.startswith("  process  ")])
+          == 20,
+          "a long exclusion list is cut at twenty lines, with the true count "
+          "in the line above")
+    check("NOT EXCLUDED  process" in _join(crowd["observed"])
+          and "NOT EXCLUDED  process" not in _join(shown["observed"]),
+          "the process line appears when Pro is not excluded and only then")
+    check("boom" in decide_nic(None, "boom")["observed"]
+          and "<unreadable>" in _join(decide_nic([("Dock", "d", None)],
+                                                 None)["observed"]),
+          "an adapter list that failed names the reason, and an adapter "
+          "whose setting is unreadable says so")
+    flagged = [decide_nic(None, "e"), decide_nic([], None),
+               decide_nic([("a", "d", "Disabled")], None),
+               decide_nic([("a", "d", None)], None),
+               decide_events([], [("A", "x"), ("B", "y"), ("C", "z")], 3, []),
+               decide_events([], [("C", "z")], 3, []),
+               decide_pro_running(None)]
+    check(all([r["dataloss"] is True for r in flagged]),
+          "every DL-04, DL-12 and DL-13 record, Info and Pass as well as "
+          "Warn, stays in the data-loss block  <-- pinned defect")
+
+    # The console must not crash on a name the code page cannot hold.
+    cp1252 = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+    check(make_output_safe(cp1252) is True,
+          "a stream that can be reconfigured is made safe")
+    print(u"user \u0416", file=cp1252)
+    cp1252.flush()
+    check(cp1252.buffer.getvalue() == b"user \\u0416\n",
+          "and a character outside its code page prints as an escape instead "
+          "of raising UnicodeEncodeError  <-- pinned defect")
+
+    class _NoReconfigure(object):
+        def reconfigure(self, **kwargs):
+            raise ValueError("cannot")
+
+    check(make_output_safe(io.StringIO()) is False
+          and make_output_safe(_NoReconfigure()) is False,
+          "while a stream that cannot be reconfigured is left alone")
+
+    # --json is one document, with or without --report.
+    jr_dir = tempfile.mkdtemp(prefix="prostall-json-report-")
+    try:
+        code, out, err = with_env(fake_healthy, ["--json", "--report", jr_dir])
+        check(json.loads(out)["prostall"] == 1,
+              "--json with --report prints one JSON document on stdout  "
+              "<-- pinned defect")
+        check("report :" in err and "report :" not in out,
+              "and the report paths go to stderr")
+        check(len(os.listdir(jr_dir)) == 2, "while both files are written")
+    finally:
+        shutil.rmtree(jr_dir, ignore_errors=True)
+
+    class OffMachine(FakeEnv):
+        windows = False
+
+    code, out, err = with_env(OffMachine, ["--json"])
+    check("almost every probe" in err and "almost every probe" not in out
+          and json.loads(out)["prostall"] == 1,
+          "off Windows the note goes to stderr and stdout stays a document")
+
+    # The reading layer, reached with stand-ins instead of left unreached.
+    fake_dll = types.SimpleNamespace(
+        shell32=types.SimpleNamespace(IsUserAnAdmin=lambda: 1))
+    check(with_windll(fake_dll, winenv.elevated) is True
+          and with_windll(_BrokenWindll(), winenv.elevated) is False,
+          "the elevation answer is read, and a failing query is not elevated")
+
+    def fill_memory(ref):
+        ref._obj.ullTotalPhys = 8 * 1024 ** 3
+        ref._obj.ullAvailPhys = 2 * 1024 ** 3
+        return 1
+
+    check(with_windll(types.SimpleNamespace(kernel32=types.SimpleNamespace(
+        GlobalMemoryStatusEx=fill_memory)), winenv.memory) == (8.0, 2.0),
+        "memory is read in gigabytes from the two physical-memory fields")
+    check(with_windll(types.SimpleNamespace(kernel32=types.SimpleNamespace(
+        GlobalMemoryStatusEx=lambda ref: 0)), winenv.memory) == (None, None)
+        and with_windll(_BrokenWindll(), winenv.memory) == (None, None),
+        "and a call that reports failure, or raises, is unread")
+
+    registry_calls = []
+
+    class _Key(object):
+        def Close(self):
+            registry_calls.append("close")
+
+    def create_key(hive, sub, reserved, access):
+        registry_calls.append(("create", hive, sub, access))
+        return _Key()
+
+    fake_winreg = types.ModuleType("winreg")
+    fake_winreg.HKEY_CURRENT_USER = "hkcu"
+    fake_winreg.HKEY_LOCAL_MACHINE = "hklm"
+    fake_winreg.KEY_SET_VALUE = 2
+    fake_winreg.REG_SZ = 1
+    fake_winreg.CreateKeyEx = create_key
+    fake_winreg.SetValueEx = lambda key, name, reserved, kind, value: \
+        registry_calls.append(("set", name, kind, value))
+    real_winreg = sys.modules.get("winreg", absent)
+    sys.modules["winreg"] = fake_winreg
+    try:
+        live.reg_write(GPU_PREFERENCE_KEY, "Pro.exe", "GpuPreference=2;")
+    finally:
+        sys.modules.pop("winreg", None)
+        sys.modules.update(
+            dict([("winreg", real_winreg)][:int(real_winreg is not absent)]))
+    check(registry_calls == [
+        ("create", "hkcu", r"Software\Microsoft\DirectX\UserGpuPreferences", 2),
+        ("set", "Pro.exe", 1, "GpuPreference=2;"), "close"],
+        "the one registry write sets a string value under the current user "
+        "and closes the key, proved against a stand-in registry module that "
+        "never touches the real one")
+
+    def raise_os(*args, **kwargs):
+        raise OSError("boom")
+
+    tmp = tempfile.gettempdir()
+    real_isdir, real_isfile = os.path.isdir, os.path.isfile
+    real_listdir, real_stat = os.listdir, os.stat
+    os.path.isdir = raise_os
+    try:
+        dir_error = live.isdir(tmp)
+    finally:
+        os.path.isdir = real_isdir
+    os.path.isfile = raise_os
+    try:
+        file_error = live.isfile(tmp)
+    finally:
+        os.path.isfile = real_isfile
+    os.listdir = raise_os
+    try:
+        list_error = live.subdirs(tmp)
+    finally:
+        os.listdir = real_listdir
+    check(dir_error is False and file_error is False and list_error == [],
+          "a folder that vanishes or locks mid-read answers absence, never a "
+          "traceback")
+    scan_root = tempfile.mkdtemp(prefix="prostall-scan-")
+    try:
+        for name in ("a.txt", "b.txt"):
+            handle = io.open(os.path.join(scan_root, name), "w")
+            handle.close()
+
+        def stat_denies(path, *args, **kwargs):
+            if str(path).endswith("a.txt"):
+                raise OSError("denied")
+            return real_stat(path, *args, **kwargs)
+
+        os.stat = stat_denies
+        try:
+            walked, walked_bad = live.scan(scan_root)
+        finally:
+            os.stat = real_stat
+        check([e.name for e in walked] == ["b.txt"] and len(walked_bad) == 1
+              and "denied" in walked_bad[0],
+              "a file whose attributes cannot be read is named as unreadable "
+              "and the walk goes on")
+    finally:
+        shutil.rmtree(scan_root, ignore_errors=True)
+
+    started = time.time()
+    raises(lambda: winenv._run([sys.executable, "-c",
+                                "import time; time.sleep(30)"], timeout=0.5),
+           "a child that hangs is killed at its timeout and raises, instead "
+           "of holding the run for two minutes",
+           kind=subprocess.TimeoutExpired)
+    check(time.time() - started < 20, "and it was killed, not waited for")
+    check(winenv._run([sys.executable, "-c",
+                       "import sys; sys.stderr.write('oops\\n'); sys.exit(3)"])
+          == (3, "", "oops")
+          and winenv._run([sys.executable, "-c", "import sys; sys.exit(4)"])[2]
+          == "exit code 4",
+          "a child's exit code, output and first error line are returned, "
+          "and a silent failure still gets a reason")
+
+    lines, code = summarize(3, ["it broke"])
+    check(code == 1 and lines == ["4 assertions, 1 failed",
+                                  "  FAILED: it broke"],
+          "a failing self-test says how many failed, names each, and exits 1")
+    check(summarize(2, []) == (["2 assertions, 0 failed"], 0),
+          "and a clean one exits 0")
+    imported = runpy.run_path(os.path.abspath(__file__),
+                              run_name="prostall_imported")
+    check(callable(imported["main"]),
+          "importing the file defines the tool and runs nothing")
+
+    # ------------------------------------------ boundaries and defaults, pinned
+    print("-" * 70)
+    print("boundaries and defaults that a mutation sweep found unpinned")
+    no_apply_key = dict([(k, v) for k, v in opts_with().items()
+                         if k != "apply"])
+    keyless_env = fake_sick()
+    keyless = run(keyless_env, no_apply_key)
+    check(keyless["applied"] == [] and keyless_env.written == [],
+          "options that never mention --apply apply nothing: the default is "
+          "off, so a caller that forgets the key cannot arm the fixes  "
+          "<-- pinned defect")
+    check(fix_cache_aside(FakeEnv(), [], {"cache_path": r"C:\nowhere"})
+          is None and fix_cache_aside(FakeEnv(), [], {}) is None,
+          "a cache folder that is gone, or never named, is left alone  "
+          "<-- pinned defect")
+    applied_sick = run(fake_sick(), opts_with(apply=True))["applied"]
+    check([r["result"] for r in applied_sick if r["id"] == "AP-02"][0]
+          .endswith("(previous: <none>)"),
+          "a graphics preference with no previous value says so in its result")
+    check(decide_pro_running([])["dataloss"] is True
+          and decide_pro_running(["x"])["dataloss"] is True,
+          "DL-12 stays in the data-loss block when Pro is closed as well as "
+          "when it runs  <-- pinned defect")
+    check("only SMB client connectivity events" in smb_only["title"],
+          "an SMB-only timeline says so in its title  <-- pinned defect")
+    some_unreadable = decide_events([], [("C", "z")], 3, [])
+    check("nothing recorded" in some_unreadable["title"]
+          and "nothing recorded" not in decide_events(
+              [], [("A", "x"), ("B", "y"), ("C", "z")], 3, [])["title"],
+          "one unreadable log of three is a quiet timeline and three of "
+          "three is an unread one  <-- pinned defect")
+    listed = [l for l in _join(decide_events(
+        forty + [("2026-09-02 00:00:00", "e40")], [], 3, [])["observed"])
+        .split("\n") if l.startswith("2026-09-0")]
+    check(len(listed) == 40,
+          "forty-one events list forty rows, not all of them  "
+          "<-- pinned defect")
+    check(decide_share_latency([])["status"] == "Info"
+          and "No recent project lives on a share"
+          in decide_share_latency([])["observed"],
+          "no project on a share is Info and says why")
+    check("more share folder" not in _join(decide_share_latency(
+        [("a", 40, 3, None)])["observed"])
+        and "older recent project" not in _join(decide_aprx(
+            "closed", [project()])["observed"]),
+        "a cap that omitted nothing prints no line about omissions  "
+        "<-- pinned defect")
+    check(FILE_ATTRIBUTE_RECALL_ON_OPEN == 0x40000
+          and FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS == 0x400000,
+          "the two recall attribute bits are the documented values, not "
+          "whatever the constants happen to hold  <-- pinned defect")
+    check(decide_tcp("T-1", "Network", "t", "h", 1, (True, 250, None), 250,
+                     "i", "f")["status"] == "Pass"
+          and decide_tcp("T-1", "Network", "t", "h", 1, (True, 251, None),
+                         250, "i", "f")["status"] == "Warn",
+          "a connect exactly at the allowance passes and one millisecond "
+          "over warns")
+    for flag, value, wanted in (("--timeout", "1", False),
+                                ("--sde-port", "1", False),
+                                ("--sde-port", "65535", False),
+                                ("--sde-port", "0", True),
+                                ("--sde-port", "65536", True)):
+        code, _out, _err = with_env(fake_healthy, [flag, value])
+        check((code == 64) is wanted,
+              "%s %s is %s  <-- pinned defect"
+              % (flag, value, "refused" if wanted else "accepted"))
+    healthy_doc = run(fake_healthy(), opts_with())
+    sick_doc = run(fake_sick(), opts_with())
+    for label, doc in (("healthy", healthy_doc), ("sick", sick_doc)):
+        rendered = render(doc)
+        split = [n for n, l in enumerate(rendered)
+                 if l.startswith("--- PERFORMANCE")][0]
+        placed = [(rendered.count(render_check(c)[0]),
+                   [n for n, l in enumerate(rendered)
+                    if l == render_check(c)[0]][0] < split, c["dataloss"])
+                  for c in doc["checks"]]
+        check(all([once == 1 and before is dataloss
+                   for once, before, dataloss in placed]),
+              "%s run: every check prints exactly once, data-loss ahead of "
+              "the performance heading and performance after it  "
+              "<-- pinned defect" % label)
+        check(bool(doc["fixable"]) == any(["have a fix here" in l
+                                           for l in rendered]),
+              "%s run: the fix offer prints exactly when a fix exists  "
+              "<-- pinned defect" % label)
+    check(sick_doc["fixable"], "and the sick run does have one")
+    code, out, err = with_env(fake_healthy, ["--json"])
+    check("almost every probe" not in err
+          and out.strip() == json.dumps(json.loads(out), indent=1,
+                                        sort_keys=True),
+          "on a Windows host there is no off-Windows note, and the JSON keys "
+          "are sorted so two reports diff cleanly  <-- pinned defect")
+
     # ------------------------------------------------------- the harness itself
     print("-" * 70)
     print("the harness records a failure as a failure")
@@ -5229,22 +6098,56 @@ def self_test():
           "and every one of them printed a line the operator can see")
 
     print("-" * 70)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for item in failed:
-            print("  FAILED: %s" % item)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    lines, code = summarize(passed[0], failed)
+    for line in lines:
+        print(line)
+    return code
 
 
 # =============================================================================
 # COMMAND LINE
 # =============================================================================
 
+USAGE_ERROR = 64
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a bad flag, and 2 means a finding that bears on
+    lost edits. A mistyped or abbreviated flag must not read as that."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        sys.exit(USAGE_ERROR)
+
+
+def host_problem(host):
+    """Why this is not a host name, or None. A URL pasted as a host is the
+    common typo, and a probe of it would blame a server nobody asked about."""
+    if not host or not host.strip():
+        return "it is empty"
+    if re.search(r"[\s/\\?#@]", host):
+        return "it holds a space, a slash or another character a host name " \
+               "cannot (give the host only, with no scheme and no path)"
+    return None
+
+
+def make_output_safe(stream):
+    """Make a stream that cannot encode a character print an escape instead.
+
+    A redirected console on a cp1252 Windows host raised UnicodeEncodeError
+    on a user name or path outside that code page, and the traceback exited 1.
+    Returns False when the stream cannot be reconfigured.
+    """
+    try:
+        stream.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError, OSError):
+        return False
+    return True
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="prostall.py",
         allow_abbrev=False,
         description="Diagnose why ArcGIS Pro is slow on this workstation, and "
@@ -5293,11 +6196,19 @@ def main(argv=None):
     if args.timeout < 1:
         print("error: --timeout must be at least 1 millisecond.",
               file=sys.stderr)
-        return 64
+        return USAGE_ERROR
     if not 1 <= args.sde_port <= 65535:
         print("error: --sde-port must be between 1 and 65535, got %d."
               % args.sde_port, file=sys.stderr)
-        return 64
+        return USAGE_ERROR
+    for flag, host in (("--sde-server", args.sde_server),
+                       ("--portal", args.portal)):
+        if host is not None and host_problem(host):
+            print("error: %s %r is not a host name: %s."
+                  % (flag, host, host_problem(host)), file=sys.stderr)
+            return USAGE_ERROR
+
+    make_output_safe(sys.stdout)
 
     env = Env()
     if not env.windows:
@@ -5327,12 +6238,14 @@ def main(argv=None):
         except (OSError, IOError) as exc:
             print("error: could not write the report: %s" % exc,
                   file=sys.stderr)
-            return 64
-        print("")
-        print("  report : %s" % text_path)
-        print("  report : %s" % json_path)
+            return USAGE_ERROR
+        # With --json, stdout is one document and nothing else.
+        out = sys.stderr if args.json else sys.stdout
+        print("", file=out)
+        print("  report : %s" % text_path, file=out)
+        print("  report : %s" % json_path, file=out)
         print("  Diff the JSON against a known-good workstation to isolate "
-              "what is different about this one.")
+              "what is different about this one.", file=out)
 
     return exit_code(document["checks"])
 
