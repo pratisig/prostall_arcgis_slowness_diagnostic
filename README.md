@@ -476,6 +476,49 @@ different time zones would otherwise disagree on every dated line.
 A check-only run still evaluates the fix gates and prints what it would have done. `applied` is
 empty unless `--apply` was given, and the self-test asserts that across a whole run.
 
+## ArcGIS Pro toolbox, and the HTML report
+
+[`toolbox/`](toolbox/LISEZMOI.md) wraps this same diagnostic as an ArcGIS Pro Python Toolbox, and
+renders the result as one self-contained HTML file. `prostall.py` itself stays a single file with no
+`arcpy` import; the toolbox and the renderer sit beside it.
+
+| File | What it is |
+|---|---|
+| `toolbox/ProstallDiagnostic.pyt` | Two tools: the diagnostic, and the offline self-test |
+| `toolbox/html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
+| `tests/test_toolbox.py` | 54 assertions over both, on a stand-in `arcpy` |
+
+Install by copying `prostall.py` next to the two toolbox files, then Catalog pane > Toolboxes > Add
+Toolbox, pointing at `ProstallDiagnostic.pyt`.
+
+The HTML is one page with no external asset at all, so it opens on a workstation that is offline:
+an act-first banner that says when nothing was determined rather than reading as clean, filters and
+a text search in local JavaScript, every check with its observed value, the fix gates, the undo
+command of anything applied, and the JSON document embedded for the diff. A
+`Content-Security-Policy` header allows no external source.
+
+The report is full of strings the machine supplied, not the operator: account names, paths off a
+file server, adapter descriptions, Defender exclusion paths, event text. Every one is escaped, and
+the embedded JSON encodes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`, so a folder name on a
+share cannot become markup in the operator's browser and cannot close the script element early. The
+JSON still decodes to the identical document. `tests/test_toolbox.py` asserts all of it against a
+document whose every field is a payload.
+
+**Running it from inside ArcGIS Pro means ArcGIS Pro is open.** DL-12 reports Pro as running and
+lands in the act-first list, PF-22 is refused because a project file must not be held open while Pro
+may be saving it, and AP-01 is refused for the same reason. A run from the Geoprocessing pane is a
+workstation report minus the project-file checks. For the full set, close Pro and run
+`prostall.py` in the editor's own session. The page says which of the two it was.
+
+```
+python tests/test_toolbox.py      # 54 assertions over the renderer and the toolbox
+python prostall.py --self-test    # 629 assertions over the diagnostic
+```
+
+The toolbox test executes the `.pyt` itself against a stand-in `arcpy`, so what runs there is the
+toolbox's own `getParameterInfo`, `updateMessages` and `execute`, through to the three files it
+writes. Not a copy of them.
+
 ## Limits
 
 - It reads a workstation. It does not read a server. Nothing here opens a geodatabase, runs a
@@ -548,6 +591,14 @@ empty unless `--apply` was given, and the self-test asserts that across a whole 
 - The report carries the account name, local paths, connection file names (names only, never
   contents), exclusion paths and layer names. Read it before you send it to anyone.
 - If `--report` cannot be written, the exit code is 64 whatever the findings were.
+- The HTML report is a rendering of the same document, not a second reading: it can be no more
+  determined than the run behind it. Its filters need JavaScript; without it every check stays
+  visible and nothing is hidden.
+- The toolbox writes into a folder you name and creates it if it is missing. It does not check that
+  the folder is one you meant, and ArcGIS Pro runs it with the privileges of the Pro session.
+- `tests/test_toolbox.py` executes the `.pyt` against a stand-in `arcpy`, which is enough to prove
+  the parameter surface, the validation and the file writes, and not enough to prove that ArcGIS Pro
+  itself accepts the `datatype` names. Open the toolbox once in Pro before you rely on it.
 
 ## Sources
 
