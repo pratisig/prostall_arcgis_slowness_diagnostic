@@ -1,6 +1,7 @@
-r"""Render a prostall report document as one self-contained HTML page.
+r"""Render an ArcGIS Pro Performance Analyser report as one self-contained
+HTML page.
 
-A pure function over the document prostall.run() returns: no ArcGIS import, no
+A pure function over the document the analyser returns: no ArcGIS import, no
 network, no template engine, no external asset. That matters twice over. The
 report is opened from a file:// URL on a workstation that may be offline or
 air-gapped, so a CDN link would be a broken page. And the report is full of
@@ -12,10 +13,10 @@ contains markup must not become script in the operator's browser.
 Every number on the page comes from the kpi mapping a check carried, never
 from a sentence parsed back into a number. A gauge that had to read its value
 out of prose would be a number this renderer invented on the way to the page,
-which is the same defect prostall exists to prevent, moved downstream.
+which is the same defect this analyser exists to prevent, moved downstream.
 
-    import prostall, html_report
-    doc = prostall.run(prostall.Env(), {...})
+    import arcgis_pro_performance_analyser as engine, html_report
+    doc = engine.run(engine.Env(), {...})
     open(path, "w", encoding="utf-8").write(html_report.render_html(doc))
 """
 
@@ -33,7 +34,7 @@ except ImportError:                   # pragma: no cover - Python 2 fallback
     def _esc(text, quote=True):
         return _cgi_escape("%s" % text, quote)
 
-# The five statuses, and nothing else: the same contract prostall enforces.
+# The five statuses, and nothing else: the same contract the analyser enforces.
 STATUS_CLASSES = {
     "Pass": "st-pass",
     "Warn": "st-warn",
@@ -63,7 +64,7 @@ EXIT_MEANING = {
     64: "A usage error, or the report could not be written.",
 }
 
-# The symptom key prostall writes into its impact lines. Reproduced here so
+# The symptom key the analyser writes into its impact lines. Reproduced here so
 # the flags on the page agree with the letters in the text.
 SYMPTOM_FALLBACK = (
     ("S1", "the project opens slowly, minutes rather than seconds"),
@@ -138,7 +139,7 @@ def health_score(document):
 
     None when nothing was determined. A machine this tool could not read is
     not a machine that scored 100, and drawing a green gauge over a run that
-    measured nothing would be the report's own version of the defect prostall
+    measured nothing would be the report's own version of the defect this tool
     was rebuilt around.
 
     Only verdicts move the score. Info and Skipped move the coverage figure
@@ -280,7 +281,7 @@ def gauges(document):
 def symptom_flags(document):
     """{symptom: [check ids]} for the findings that name that symptom.
 
-    Derived from the impact text, which is where prostall already writes the
+    Derived from the impact text, which is where the analyser already writes the
     symptom letter. Nothing is inferred: a check whose impact line names no
     symptom flags none.
     """
@@ -776,10 +777,10 @@ def render_html(document, verbose=False, exit_code=None, meta=None):
     act = len(document.get("act_first") or [])
 
     head = ['<header class="top"><h1>Diagnostic de poste ArcGIS Pro</h1>',
-            '<div class="sub">prostall &mdash; format de rapport %s &middot; '
+            '<div class="sub">ArcGIS Pro Performance Analyser &mdash; format de rapport %s &middot; '
             'relev&eacute; le <b>%s UTC</b> &middot; compte <b>%s</b> &middot; '
             '&eacute;lev&eacute; <b>%s</b></div>'
-            % (esc(document.get("prostall")), esc(document.get("taken")),
+            % (esc(document.get("report_version")), esc(document.get("taken")),
                esc(document.get("user")), esc(document.get("elevated")))]
     if code is not None:
         head.append('<div class="sub">code de sortie <b>%s</b> &mdash; %s'
@@ -832,7 +833,8 @@ def render_html(document, verbose=False, exit_code=None, meta=None):
             "".join(controls),
             dl_block, perf_block,
             _fixes_section(document), _legend(), _json_section(document),
-            '<footer>G&eacute;n&eacute;r&eacute; par prostall. Lecture seule '
+            '<footer>G&eacute;n&eacute;r&eacute; par ArcGIS Pro Performance Analyser. '
+            'Lecture seule '
             'sauf si les correctifs ont &eacute;t&eacute; activ&eacute;s '
             'explicitement. Aucun h&ocirc;te n&rsquo;est contact&eacute; en '
             'dehors de ceux nomm&eacute;s au lancement. Rien ici ne supprime '
@@ -849,7 +851,7 @@ def render_html(document, verbose=False, exit_code=None, meta=None):
             "img-src data:\">\n"
             "<title>Diagnostic ArcGIS Pro &mdash; %s</title>\n"
             "<style>%s</style>\n</head>\n<body>\n%s\n"
-            "<script type=\"application/json\" id=\"prostall-report\">%s"
+            "<script type=\"application/json\" id=\"performance-report\">%s"
             "</script>\n<script>%s</script>\n</body>\n</html>\n"
             % (esc(document.get("taken")), CSS, "".join(body),
                _embedded_json(document), JS))

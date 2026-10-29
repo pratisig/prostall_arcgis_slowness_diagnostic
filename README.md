@@ -1,4 +1,4 @@
-# prostall
+# ArcGIS Pro Performance Analyser
 
 Diagnose why ArcGIS Pro is slow on this workstation, and never report a finding the machine did
 not produce. Read-only by default: nothing changes, and no host is contacted unless you name it.
@@ -29,13 +29,13 @@ liar on the first day. Ask Microsoft Defender for its exclusion lists from the e
 session, and it does not refuse. It answers, and where each list should be it puts one line:
 `N/A: Must be an administrator to view exclusions`. Compare that line against the folders Pro
 needs, and every folder reads as missing. The report then asks the security team for exclusions
-that may already exist, off a list it never saw. prostall recognises that line, says the lists are
+that may already exist, off a list it never saw. The analyser recognises that line, says the lists are
 hidden, and gives no verdict. The same run on the test workstation showed the pattern twice more:
 the network adapter's power setting came back empty, and the SMB client log answered "Access is
 denied". Both are reported as unread, not as healthy.
 
 ```
-$ python prostall.py --self-test
+$ python arcgis_pro_performance_analyser.py --self-test
 ----------------------------------------------------------------------
 the status contract: a verdict needs a measurement
 PASS  Pass is an accepted status
@@ -206,8 +206,8 @@ It runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and
 package is not needed.
 
 ```
-git clone https://github.com/uhsear/prostall.git
-python prostall.py --self-test
+git clone https://github.com/pratisig/prostall_arcgis_slowness_diagnostic.git
+python arcgis_pro_performance_analyser.py --self-test
 ```
 
 `--self-test` needs no ArcGIS install, so you can check the tool before you point it at
@@ -248,7 +248,7 @@ ships without source, and this author has not run it, so no comparison is made h
 Event Viewer shows the same events as DL-13, one log at a time. Microsoft's
 [performance analyzer for Defender](https://learn.microsoft.com/en-us/defender-endpoint/tune-performance-defender-antivirus)
 (`New-MpPerformanceRecording`) proves which files on-access scanning actually slows. Run it, elevated,
-before you ask for any exclusion PF-17 lists. prostall puts these readings side by side in one
+before you ask for any exclusion PF-17 lists. The analyser puts these readings side by side in one
 report, from the editor's own session, and says which of them it could not read.
 
 ## Quick start
@@ -256,14 +256,14 @@ report, from the editor's own session, and says which of them it could not read.
 Run it in the editor's own session, without elevation, while Pro is closed.
 
 ```
-python prostall.py
+python arcgis_pro_performance_analyser.py
 ```
 
 That reads the machine and prints the report. Nothing is written and no setting is changed. No
 host is contacted, apart from reading a recent project folder that already sits on a share.
 
 ```
-python prostall.py --sde-server gisdb01 --portal gis.example.org --report C:\Temp\properf
+python arcgis_pro_performance_analyser.py --sde-server gisdb01 --portal gis.example.org --report C:\Temp\properf
 ```
 
 That adds two bounded TCP probes and writes the report as text and as JSON.
@@ -461,7 +461,7 @@ findings to act on first. `--report` writes the same thing as text, plus a JSON 
 
 ```json
 {
- "prostall": 1,
+ "report_version": 3,
  "taken": "2026-09-17 20:59",
  "user": "editor",
  "elevated": false,
@@ -490,18 +490,31 @@ empty unless `--apply` was given, and the self-test asserts that across a whole 
 
 ## ArcGIS Pro toolbox, and the HTML report
 
-[`toolbox/`](toolbox/LISEZMOI.md) wraps this same diagnostic as an ArcGIS Pro Python Toolbox, and
-renders the result as one self-contained HTML file. `prostall.py` itself stays a single file with no
-`arcpy` import; the toolbox and the renderer sit beside it.
+[`ArcGISPro_PerformanceAnalyser/`](ArcGISPro_PerformanceAnalyser/LISEZMOI.md) is this same
+diagnostic as an ArcGIS Pro Python Toolbox, rendering the result as one self-contained HTML file.
+It ships as **one file**: the engine and the renderer are inlined into the `.pyt`, so sharing it
+is copying it. There is no sibling module to keep beside it, and therefore nothing that can go
+missing on the machine it lands on.
 
 | File | What it is |
 |---|---|
-| `toolbox/ProstallDiagnostic.pyt` | Two tools: the diagnostic, and the offline self-test |
-| `toolbox/html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
-| `tests/test_toolbox.py` | 54 assertions over both, on a stand-in `arcpy` |
+| `ArcGISPro_PerformanceAnalyser/ArcGISPro_PerformanceAnalyser.pyt` | **The shipped artefact.** Two tools, with the engine and the renderer inlined |
+| `arcgis_pro_performance_analyser.py` | The diagnostic engine and CLI. A single file, no `arcpy` import |
+| `html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
+| `toolbox_glue.py` | The ArcGIS Pro glue. The only part that imports `arcpy` |
+| `build_toolbox.py` | Assembles those three into the one `.pyt` |
+| `tests/test_toolbox.py` | 82 assertions over all of it, on a stand-in `arcpy` |
 
-Install by copying `prostall.py` next to the two toolbox files, then Catalog pane > Toolboxes > Add
-Toolbox, pointing at `ProstallDiagnostic.pyt`.
+Install by copying that one `.pyt` anywhere stable, then Catalog pane > Toolboxes > Add Toolbox,
+pointing at it. The two tools appear under "ArcGIS Pro Performance Analyser".
+
+The `.pyt` is generated: **edit the sources and run `python build_toolbox.py`**, never the `.pyt`
+itself. `tests/test_toolbox.py` runs the build and compares the result byte for byte, so an
+artefact that has drifted from its sources cannot sit in the repository unnoticed. The sources
+stay apart because they are separately testable: the engine self-tests with no ArcGIS installed
+and the renderer is a pure function, so only the glue needs `arcpy`. The merge is a
+concatenation, and the build stops if two sources ever bind the same top-level name, because one
+would silently shadow the other.
 
 The HTML is one page with no external asset at all, so it opens on a workstation that is offline:
 
@@ -520,9 +533,11 @@ The HTML is one page with no external asset at all, so it opens on a workstation
 
 A `Content-Security-Policy` header allows no external source.
 
-**Every number on the page comes from a `kpi` mapping the check carried.** Report format 2 adds that
-mapping to the checks that measure a number, and `make_check` refuses one that is not a mapping of
-numbers - a string or a boolean is refused. A gauge whose value had been parsed back out of a
+**Every number on the page comes from a `kpi` mapping the check carried.** Report format 2 added
+that mapping to the checks that measure a number, and `make_check` refuses one that is not a
+mapping of numbers - a string or a boolean is refused. The version reads 3 now, because the
+document's own `prostall` key became `report_version` and a renamed key is a format a consumer
+written against 2 would read wrong. A gauge whose value had been parsed back out of a
 sentence would be a number the renderer invented on the way to the page, which is the defect this
 tool exists to prevent, moved downstream. A check that carries no number draws no gauge.
 
@@ -534,14 +549,17 @@ JSON still decodes to the identical document. `tests/test_toolbox.py` asserts al
 document whose every field is a payload.
 
 **Running it from inside ArcGIS Pro means ArcGIS Pro is open.** DL-12 reports Pro as running and
-lands in the act-first list, PF-22 is refused because a project file must not be held open while Pro
-may be saving it, and AP-01 is refused for the same reason. A run from the Geoprocessing pane is a
+lands in the act-first list, and the five checks that read the project file - PF-01, PF-09, PF-10,
+PF-14 and PF-22 - are refused, because a project file must not be held open while Pro may be
+saving it. AP-01 is refused for the same reason. A run from the Geoprocessing pane is therefore a
 workstation report minus the project-file checks. For the full set, close Pro and run
-`prostall.py` in the editor's own session. The page says which of the two it was.
+`arcgis_pro_performance_analyser.py` in the editor's own session. The page says which of the two
+it was.
 
 ```
-python tests/test_toolbox.py      # 54 assertions over the renderer and the toolbox
-python prostall.py --self-test    # 708 assertions over the diagnostic
+python tests/test_toolbox.py      # 82 assertions over the renderer, the glue and the built .pyt
+python arcgis_pro_performance_analyser.py --self-test   # 708 assertions over the diagnostic
+python build_toolbox.py --check   # the shipped .pyt is what its three sources build to
 ```
 
 The toolbox test executes the `.pyt` itself against a stand-in `arcpy`, so what runs there is the

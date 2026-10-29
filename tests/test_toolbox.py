@@ -4,13 +4,17 @@ Run with the standard library only, on any Python 3.9+:
 
     python tests/test_toolbox.py
 
-These exercise the code that actually ships. html_report is imported directly.
-The .pyt is executed against a stand-in arcpy module, so the toolbox's own
-getParameterInfo, updateMessages and execute are what run here, not a copy of
-them - which is the difference between a test that proves something and one
-that proves the test agrees with itself.
+These exercise the code that actually ships. The renderer is imported
+directly, and the single-file .pyt is executed against a stand-in arcpy
+module, so the toolbox's own getParameterInfo, updateMessages and execute are
+what run here, not a copy of them - which is the difference between a test
+that proves something and one that proves the test agrees with itself.
+
+The .pyt is a generated artefact, so the first thing checked is that it is
+still exactly what its three sources build to.
 """
 
+import ast
 import io
 import json
 import os
@@ -21,13 +25,15 @@ import tempfile
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLBOX = os.path.join(ROOT, "toolbox")
-for path in (ROOT, TOOLBOX):
+BOXDIR = os.path.join(ROOT, "ArcGISPro_PerformanceAnalyser")
+PYT = os.path.join(BOXDIR, "ArcGISPro_PerformanceAnalyser.pyt")
+for path in (ROOT, BOXDIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-import prostall          # noqa: E402
-import html_report       # noqa: E402
+import arcgis_pro_performance_analyser as engine  # noqa: E402
+import build_toolbox    # noqa: E402
+import html_report      # noqa: E402
 
 PASSED = [0]
 FAILED = []
@@ -99,7 +105,7 @@ def install_fake_arcpy():
     arcpy.ExecuteError = _ExecuteError
     arcpy.GetInstallInfo = lambda: {"Version": "3.4", "BuildNumber": "57127"}
     env = types.SimpleNamespace(scratchFolder=os.path.join(
-        tempfile.gettempdir(), "prostall_scratch"))
+        tempfile.gettempdir(), "properf_scratch"))
     arcpy.env = env
     sys.modules["arcpy"] = arcpy
 
@@ -107,13 +113,41 @@ def install_fake_arcpy():
 install_fake_arcpy()
 
 
+# =============================================================================
+# The shipped artefact is generated, so first: is it still what it was built
+# from, and is it really the one file it claims to be?
+# =============================================================================
+
+PYT_SOURCE = io.open(PYT, encoding="utf-8", newline="").read()
+
+check(build_toolbox.build() == PYT_SOURCE,
+      "the shipped .pyt is byte-for-byte what its three sources build to: "
+      "edit the sources and run build_toolbox.py, never the .pyt")
+PYT_IMPORTS = set()
+for _node in ast.walk(ast.parse(PYT_SOURCE)):
+    if isinstance(_node, ast.Import):
+        PYT_IMPORTS.update(alias.name for alias in _node.names)
+    elif isinstance(_node, ast.ImportFrom) and _node.module:
+        PYT_IMPORTS.add(_node.module)
+check(not PYT_IMPORTS & {"arcgis_pro_performance_analyser", "html_report",
+                         "prostall"},
+      "and it imports no sibling module, so copying that one file is "
+      "enough - nothing can go missing on the machine it lands on. Checked "
+      "on the parse tree, not on substrings: the renderer's own docstring "
+      "quotes those imports as usage text")
+check("prostall" not in PYT_SOURCE.lower(),
+      "the shipped artefact carries no trace of the old name")
+check(PYT_SOURCE.count("# BEGIN MERGE-IMPORTS") == 0,
+      "the build marker was replaced, not shipped")
+
+
 def load_pyt():
-    """Execute ProstallDiagnostic.pyt and return its module."""
-    name = "ProstallDiagnostic"
+    """Execute the shipped single-file .pyt and return its module."""
+    name = "ArcGISPro_PerformanceAnalyser"
     if name in sys.modules:
         return sys.modules[name]
     module = types.ModuleType(name)
-    module.__file__ = os.path.join(TOOLBOX, name + ".pyt")
+    module.__file__ = PYT
     sys.modules[name] = module
     source = io.open(module.__file__, encoding="utf-8").read()
     exec(compile(source, module.__file__, "exec"), module.__dict__)
@@ -125,14 +159,14 @@ def load_pyt():
 # =============================================================================
 
 def sick_document():
-    """A whole run against prostall's own stand-in sick workstation."""
-    document = prostall.run(prostall.fake_sick(), {"sde_server": "gisdb01",
+    """A whole run against the analyser's own stand-in sick workstation."""
+    document = engine.run(engine.fake_sick(), {"sde_server": "gisdb01",
                                                   "sde_port": 1433,
                                                   "portal": None,
                                                   "timeout": 4000,
                                                   "apply": False})
-    document["exit_code"] = prostall.exit_code(document["checks"])
-    document["symptoms"] = list(prostall.SYMPTOMS)
+    document["exit_code"] = engine.exit_code(document["checks"])
+    document["symptoms"] = list(engine.SYMPTOMS)
     return document
 
 
@@ -172,7 +206,7 @@ def strip_json_block(page):
     machine strings as data on purpose. Everything outside it is markup, and
     nothing in it may be markup either - see the \\u003c escaping test.
     """
-    start = page.index('id="prostall-report">')
+    start = page.index('id="performance-report">')
     end = page.index("</script>", start)
     return page[:start] + page[end:]
 
@@ -199,16 +233,16 @@ check(page.count("<script") == 2,
 
 cut = truncation_document()
 cut_page = html_report.render_html(cut)
-check(cut_page.count('id="prostall-report">') == 1,
+check(cut_page.count('id="performance-report">') == 1,
       "the report is embedded once")
 check(cut_page.count("</script>") == 2,
       "and there are exactly two closing script tags, so a value holding "
       "</script> cannot close the JSON element early and start a new one")
-check("<" not in cut_page.split('id="prostall-report">')[1].split("</script>")[0],
+check("<" not in cut_page.split('id="performance-report">')[1].split("</script>")[0],
       "and no angle bracket survives raw inside that element, so no payload "
       "in the report can be read as markup by a parser that is less strict "
       "than the spec")
-decoded = cut_page.split('id="prostall-report">')[1].split("</script>")[0]
+decoded = cut_page.split('id="performance-report">')[1].split("</script>")[0]
 check(json.loads(decoded)["user"] == cut["user"],
       "the JSON block still round-trips to the exact document, because the "
       "escaping is \\uXXXX inside strings and not a substitution")
@@ -217,7 +251,7 @@ print("-" * 70)
 print("the page carries the whole report and nothing invented")
 document = sick_document()
 page = html_report.render_html(document, verbose=True,
-                               exit_code=prostall.exit_code(document["checks"]))
+                               exit_code=engine.exit_code(document["checks"]))
 check(len(document["checks"]) > 0 and all(
     'data-status="%s"' % c["status"] in page for c in document["checks"]),
     "every check of the run is on the page, tagged with its own status")
@@ -255,8 +289,8 @@ print("the banner tells the truth about the run")
 sick_page = html_report.render_html(sick_document())
 check("traiter en" in sick_page and "perdues" in sick_page,
       "a run with data-loss findings gets the act-first banner")
-undone = prostall.run(prostall.fake_bare(), {})
-undone_code = prostall.exit_code(undone["checks"])
+undone = engine.run(engine.fake_bare(), {})
+undone_code = engine.exit_code(undone["checks"])
 undone_page = html_report.render_html(undone, exit_code=undone_code)
 check("Findings de performance" in undone_page,
       "a machine that reads back almost nothing still gets its one real "
@@ -264,8 +298,8 @@ check("Findings de performance" in undone_page,
       "banner says so rather than claiming nothing was determined")
 check(undone_code == 1,
       "and that run is exit code 1, not 3 - three checks can answer on a "
-      "bare machine, which is what prostall's own self-test pins")
-nothing = {"prostall": 1, "taken": "x", "user": "u", "elevated": False,
+      "bare machine, which is what the analyser's own self-test pins")
+nothing = {"report_version": 3, "taken": "x", "user": "u", "elevated": False,
            "checks": [{"id": "DL-05", "category": "Storage",
                        "title": "t", "status": "Info", "dataloss": True,
                        "observed": "could not be determined",
@@ -280,10 +314,10 @@ check("Rien n&rsquo;a pu &ecirc;tre" in nothing_page,
 check("n/d" in nothing_page,
       "and its health gauge reads n/d rather than drawing a score over a run "
       "that measured nothing: a green gauge on an unread machine is the same "
-      "defect prostall exists to prevent  <-- pinned defect")
-healthy = prostall.run(prostall.fake_healthy(), {})
+      "defect this analyser exists to prevent  <-- pinned defect")
+healthy = engine.run(engine.fake_healthy(), {})
 healthy_page = html_report.render_html(healthy,
-                                       exit_code=prostall.exit_code(
+                                       exit_code=engine.exit_code(
                                            healthy["checks"]))
 check("Rien &agrave; traiter" in healthy_page,
       "a run with nothing to act on says so")
@@ -317,7 +351,7 @@ score, determined, total = html_report.health_score(doc)
 check(score is not None and 0 <= score <= 100,
       "a run with verdicts gets a score: %s out of 100, from %d determined of %d"
       % (score, determined, total))
-clean = prostall.run(prostall.fake_healthy(), {})
+clean = engine.run(engine.fake_healthy(), {})
 check(html_report.health_score(clean)[0] == 100,
       "and a machine with nothing wrong scores 100, so the scale means "
       "something rather than being decoration")
@@ -325,7 +359,7 @@ undone_score = html_report.health_score(
     {"checks": [{"status": "Info"}, {"status": "Skipped"}]})
 check(undone_score[0] is None and undone_score[1] == 0,
       "a run that determined nothing has no score at all, not a score of 100: "
-      "a green gauge over an unread machine is the defect prostall exists to "
+      "a green gauge over an unread machine is the defect this analyser exists to "
       "prevent  <-- pinned defect")
 data_fail = {"checks": [{"status": "Fail", "dataloss": True}]}
 perf_fail = {"checks": [{"status": "Fail", "dataloss": False}]}
@@ -341,7 +375,7 @@ kpi_check = by_id.get("PF-13")
 if kpi_check and kpi_check.get("kpi"):
     check("Disque libre" in memory_page,
           "PF-13 carried a number, so its gauge is drawn")
-no_kpi = {"prostall": 2, "taken": "x", "user": "u", "elevated": False,
+no_kpi = {"report_version": 3, "taken": "x", "user": "u", "elevated": False,
           "checks": [{"id": "PF-13", "category": "Hardware", "title": "t",
                       "status": "Pass", "dataloss": False, "observed": "fine",
                       "expected": "", "impact": "", "fix": "",
@@ -368,7 +402,7 @@ check(isinstance(flags, dict) and all(
 manual = set()
 for check_rec in doc["checks"]:
     if check_rec["status"] in ("Fail", "Warn"):
-        for code, _l in prostall.SYMPTOMS:
+        for code, _l in engine.SYMPTOMS:
             if code in (check_rec["impact"] or ""):
                 manual.add((code, check_rec["id"]))
 derived = set((code, cid) for code, ids in flags.items() for cid in ids)
@@ -376,7 +410,7 @@ check(derived == manual,
       "and the flags are exactly what the impact lines say, check for check - "
       "nothing is inferred about a symptom a check did not name")
 check(all(("<b>%s</b>" % code) in html_report.render_html(doc)
-          for code, _l in prostall.SYMPTOMS),
+          for code, _l in engine.SYMPTOMS),
       "all five symptoms have a row, including the ones nothing flagged, so a "
       "zero is visible rather than missing")
 check('href="#check-%s"' % doc["act_first"][0] in html_report.render_html(doc),
@@ -421,13 +455,13 @@ print("-" * 70)
 print("the .pyt loads and its tools are what ArcGIS Pro will see")
 pyt = load_pyt()
 box = pyt.Toolbox()
-check(box.alias == "prostall" and len(box.tools) == 2,
+check(box.alias == "properf" and len(box.tools) == 2,
       "the toolbox exposes two tools under one alias")
 check(box.canRunInBackground is False,
       "neither runs in the background: the diagnostic reads the session it "
       "runs in, and DL-12 asks whether Pro is open")
 diagnose = pyt.Diagnose()
-verify = pyt.VerifyProstall()
+verify = pyt.VerifyAnalyser()
 check(diagnose.canRunInBackground is False and verify.canRunInBackground is False,
       "and each tool says so itself")
 params = diagnose.getParameterInfo()
@@ -443,7 +477,7 @@ check(params[8].value is False,
       "parameter cannot arm them")
 
 print("-" * 70)
-print("the toolbox refuses what prostall's parser refuses")
+print("the toolbox refuses what the analyser's parser refuses")
 for index, host in ((1, "https://gis.example.org/portal"),
                     (1, "gisdb01/share"), (3, "portal a")):
     fresh = pyt.Diagnose()
@@ -521,11 +555,21 @@ try:
           "and the gates still report what they would have done")
 
     # The messaging logic, against a run that does have act-first findings.
-    # The document is the real one from prostall's stand-in sick workstation;
-    # only prostall.run is swapped, so the toolbox's own execute is what runs.
+    # The document is the real one from the analyser's stand-in sick workstation;
+    # only run() is swapped, so the toolbox's own execute is what runs.
+    #
+    # The swap lands on the .pyt module, not on the engine module imported at
+    # the top of this file. The shipped .pyt carries its own copy of the
+    # engine and resolves engine.run through its own globals, so patching the
+    # separate module would silently not reach the tool - the assertion below
+    # pins that, because a test that patched the wrong copy would keep passing
+    # while testing nothing.
     sick = sick_document()
-    real_run = prostall.run
-    prostall.run = lambda env, opts: json.loads(json.dumps(sick))
+    check(pyt.run is not engine.run,
+          "the shipped .pyt carries its own copy of the engine, so the swap "
+          "below has to land on the .pyt to be seen by the tool")
+    real_run = pyt.run
+    pyt.run = lambda env, opts: json.loads(json.dumps(sick))
     try:
         p4 = fresh.getParameterInfo()
         p4[0].value = os.path.join(folder, "reports")
@@ -533,7 +577,7 @@ try:
         m4 = _Messages()
         fresh.execute(p4, m4)
     finally:
-        prostall.run = real_run
+        pyt.run = real_run
     rollup = [w for w in m4.warn if w.startswith("ACT ON THESE FIRST")]
     check(len(rollup) == 1, "a run with data-loss findings raises one "
                             "act-first warning in the geoprocessing window")
@@ -550,10 +594,10 @@ finally:
     shutil.rmtree(folder, ignore_errors=True)
 
 print("-" * 70)
-print("the self-test tool drives prostall's own assertions")
+print("the self-test tool drives the analyser's own assertions")
 folder = tempfile.mkdtemp()
 try:
-    v = pyt.VerifyProstall()
+    v = pyt.VerifyAnalyser()
     vp = v.getParameterInfo()
     vm = _Messages()
     buffer = io.StringIO()
@@ -564,7 +608,7 @@ try:
     finally:
         sys.stdout = real
     check("0 failed" in (vp[0].value or ""),
-          "the self-test tool reports prostall's own assertion count: %s"
+          "the self-test tool reports the analyser's own assertion count: %s"
           % vp[0].value)
     check(not vm.err, "and no assertion failed")
 finally:
