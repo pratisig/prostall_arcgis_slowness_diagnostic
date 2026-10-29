@@ -85,9 +85,12 @@ class Toolbox(object):
         self.label = "ArcGIS Pro Performance Analyser"
         self.alias = "properf"
         self.description = (
-            "Diagnose why ArcGIS Pro is slow on this workstation, and never "
-            "report a finding the machine did not produce. Read-only unless "
-            "you enable the fixes.")
+            "Deux outils.  1) Diagnostiquer la lenteur d'ArcGIS Pro : "
+            "celui qu'on lance - il lit ce poste et rend un rapport HTML. "
+            "2) Verifier l'analyseur : un controle du fichier lui-meme, a "
+            "lancer une fois sur une nouvelle machine avant de croire un "
+            "rapport. Lecture seule tant que les correctifs ne sont pas "
+            "coches.")
         self.tools = [Diagnose, VerifyAnalyser]
         self.canRunInBackground = False
 
@@ -96,19 +99,36 @@ class Diagnose(object):
     """The workstation diagnostic, with the result as HTML."""
 
     def __init__(self):
-        self.label = "Diagnose ArcGIS Pro slowness"
+        self.label = "Diagnostiquer la lenteur d'ArcGIS Pro"
         self.description = (
-            "Read this workstation's registry, storage, OneDrive redirection, "
-            "network and cache state, and report which of it explains a slow "
-            "ArcGIS Pro session and which of it could lose an edit. Read-only "
-            "unless the fixes are enabled. Writes an HTML, a JSON and a text "
-            "report.")
+            "L'OUTIL A LANCER. Lit ce poste - registre, stockage, "
+            "redirection OneDrive, reseau, cache - et rend un rapport HTML "
+            "qui dit, controle par controle, ce qui a ete mesure, ce que "
+            "cela coute a ArcGIS Pro et comment le corriger. Trente-six "
+            "controles, dont treize portent sur des modifications qui "
+            "peuvent se perdre. Lecture seule, sauf si vous cochez "
+            "explicitement les correctifs. Ecrit un HTML, un JSON et un "
+            "texte. Les parametres par defaut suffisent pour un premier "
+            "passage : ne renseignez rien.")
         self.canRunInBackground = False
-        self.category = "Diagnose"
+        self.category = "Diagnostic"
 
     def getParameterInfo(self):
+        def hinted(param, tooltip, long_help):
+            """Attach the two help fields ArcGIS Pro shows for a parameter.
+
+            `helpMessage` is the tooltip behind the little question mark;
+            `parameterHelp` is the paragraph in the tool's help panel. Both are
+            filled in here rather than left to the display name, because the
+            display name has to stay short enough to fit the pane, and a short
+            label cannot carry an example.
+            """
+            param.helpMessage = tooltip
+            param.parameterHelp = long_help
+            return param
+
         out = arcpy.Parameter(
-            displayName="Output folder",
+            displayName="Dossier de sortie",
             name="output_folder",
             datatype="DEFolder",
             parameterType="Optional",
@@ -116,81 +136,182 @@ class Diagnose(object):
         out.value = os.path.join(
             arcpy.env.scratchFolder or os.environ.get("TEMP") or ".",
             "ArcGISPro_PerformanceAnalyser")
+        hinted(out,
+               "Ou ecrire les rapports. Laisse vide pour garder le defaut.",
+               "<p>Dossier ou l'outil ecrit ses trois fichiers : le rapport "
+               "<b>HTML</b> (celui qu'on lit), le <b>JSON</b> (pour comparer "
+               "deux passages) et le <b>TXT</b> (pour coller dans un ticket).</p>"
+               "<p><b>Defaut</b> : <code>&lt;scratch&gt;\\ArcGISPro_Performance"
+               "Analyser</code>. Le dossier est cree s'il n'existe pas.</p>"
+               "<p><b>Exemple</b> : <code>C:\\Temp\\diag_analyser</code>. "
+               "Choisissez un dossier <b>local</b>, pas un partage reseau : "
+               "l'ecriture doit rester rapide et ne dependre d'aucun "
+               "serveur.</p>"
+               "<p>Rien d'existant n'est ecrase : deux passages dans la meme "
+               "seconde produisent deux jeux de fichiers.</p>")
 
         sde = arcpy.Parameter(
-            displayName="Enterprise geodatabase host to probe",
+            displayName="Hote de la geodatabase d'entreprise a sonder",
             name="sde_server",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        sde.category = "Network probes (opt-in)"
+        sde.category = "Sondes reseau (sur demande)"
+        hinted(sde,
+               "Nom du serveur SQL/Oracle de vos donnees. Vide = aucun "
+               "hote contacte.",
+               "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b> Vide, "
+               "aucun paquet ne quitte la machine et le controle DL-10 repond "
+               "<code>Info</code> au lieu d'inventer une mesure.</p>"
+               "<p>Renseigne, l'outil ouvre <b>une seule</b> connexion TCP, "
+               "mesure le temps de reponse, puis referme. Il ne s'authentifie "
+               "jamais et n'envoie aucun identifiant.</p>"
+               "<p><b>Exemple</b> : <code>gisdb01</code> ou "
+               "<code>gisdb01.monorg.ch</code>. C'est le serveur nomme dans "
+               "vos fichiers de connexion <code>.sde</code>.</p>"
+               "<p><b>A quoi ca sert</b> : une latence elevee vers ce serveur "
+               "explique a elle seule un Pro lent a l'ouverture des cartes.</p>")
 
         port = arcpy.Parameter(
-            displayName="Geodatabase port",
+            displayName="Port de la geodatabase",
             name="sde_port",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         port.value = 1433
-        port.category = "Network probes (opt-in)"
+        port.category = "Sondes reseau (sur demande)"
+        hinted(port,
+               "Port du serveur. 1433 = SQL Server (le plus courant).",
+               "<p><b>Defaut</b> : <code>1433</code> (SQL Server).</p>"
+               "<p><b>Valeurs courantes</b> : <code>1433</code> SQL Server, "
+               "<code>1521</code> Oracle, <code>5432</code> PostgreSQL.</p>"
+               "<p>Si vous ne connaissez pas le moteur, laissez 1433 : un port "
+               "ferme repond « ferme », ce qui est deja une information, et "
+               "l'outil ne devine jamais.</p>")
 
         portal = arcpy.Parameter(
-            displayName="Portal host to probe (port 443)",
+            displayName="Hote du portail a sonder (port 443)",
             name="portal",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        portal.category = "Network probes (opt-in)"
+        portal.category = "Sondes reseau (sur demande)"
+        hinted(portal,
+               "Adresse de votre portail ou d'ArcGIS Online. Vide = aucun "
+               "hote contacte.",
+               "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b></p>"
+               "<p><b>Exemple</b> : <code>gis.monorg.ch</code> pour un Portal "
+               "for ArcGIS interne, ou <code>www.arcgis.com</code> pour "
+               "ArcGIS Online.</p>"
+               "<p>Une seule connexion TCP sur le port 443, mesuree puis "
+               "refermee. Aucun identifiant n'est envoye.</p>")
 
         timeout = arcpy.Parameter(
-            displayName="Probe timeout (milliseconds)",
+            displayName="Delai des sondes (millisecondes)",
             name="timeout",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         timeout.value = 4000
-        timeout.category = "Network probes (opt-in)"
+        timeout.category = "Sondes reseau (sur demande)"
+        hinted(timeout,
+               "Duree maximale de chaque sonde. 4000 ms convient presque "
+               "toujours.",
+               "<p><b>Defaut</b> : <code>4000</code> ms (4 secondes).</p>"
+               "<p>C'est une <b>borne</b>, pas une attente : une sonde qui "
+               "repond en 40 ms rend la main en 40 ms. Le delai ne sert que "
+               "pour un serveur injoignable.</p>"
+               "<p>Augmentez a <code>10000</code> sur un reseau tres lent, "
+               "descendez a <code>1500</code> pour un passage plus rapide.</p>")
 
         verbose = arcpy.Parameter(
-            displayName="Verbose (expected text and evidence lines)",
+            displayName="Detaille (valeur attendue et lignes de preuve)",
             name="verbose",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         verbose.value = False
+        hinted(verbose,
+               "Affiche ce que l'outil attendait et ce qu'il a reellement lu.",
+               "<p><b>Defaut</b> : decoche.</p>"
+               "<p>Cochez-le quand vous devez <b>prouver</b> un resultat a "
+               "quelqu'un : chaque controle montre alors la valeur attendue et "
+               "la ligne brute lue sur la machine, en plus du verdict.</p>"
+               "<p>Decoche, le rapport reste complet ; seules ces lignes de "
+               "preuve sont repliees.</p>")
 
         text = arcpy.Parameter(
-            displayName="Also write the plain-text report",
+            displayName="Ecrire aussi le rapport texte",
             name="write_text",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         text.value = True
+        hinted(text,
+               "Ajoute un .txt, pratique a coller dans un ticket.",
+               "<p><b>Defaut</b> : coche.</p>"
+               "<p>Le <code>.txt</code> reprend le rapport HTML en texte brut. "
+               "C'est le format a coller dans un appel au support ou dans un "
+               "courriel, parce qu'il ne depend d'aucun navigateur.</p>")
 
         browser = arcpy.Parameter(
-            displayName="Open the HTML report in the default browser",
+            displayName="Ouvrir le rapport HTML dans le navigateur",
             name="open_browser",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         browser.value = True
+        hinted(browser,
+               "Ouvre le rapport a la fin. Decochez pour un lot ou un modele.",
+               "<p><b>Defaut</b> : coche.</p>"
+               "<p>Le rapport s'ouvre dans le navigateur par defaut. "
+               "Decochez-le si l'outil tourne dans un modele ModelBuilder, ou "
+               "si le navigateur est bloque par strategie de groupe : le fichier est ecrit dans "
+               "tous les cas et son chemin apparait dans les messages.</p>")
 
         apply_fixes = arcpy.Parameter(
-            displayName="Apply the gated fixes (renames the cache aside, pins "
-                        "the GPU preference)",
+            displayName="Appliquer les correctifs (renomme le cache, epingle "
+                        "le choix de carte graphique)",
             name="apply_fixes",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         apply_fixes.value = False
-        apply_fixes.category = "Changes machine state"
+        apply_fixes.category = "Modifie la machine"
+        hinted(apply_fixes,
+               "SEUL parametre qui modifie la machine. Laisse decoche, "
+               "l'outil est en lecture seule.",
+               "<p><b>Defaut</b> : <b>decoche</b>. L'outil ne fait alors que "
+               "lire.</p>"
+               "<p>Coche, deux correctifs seulement, et chacun seulement si son "
+               "propre controle l'a justifie :</p>"
+               "<ul>"
+               "<li><b>AP-01</b> renomme le dossier de cache ESRI en lui "
+               "ajoutant un suffixe <code>.properf-&lt;date&gt;</code>. "
+               "<b>Rien n'est supprime</b> : l'ancien dossier reste sur le "
+               "disque et Pro en reconstruit un neuf. Refuse depuis Pro, parce "
+               "que Pro tient ce dossier.</li>"
+               "<li><b>AP-02</b> ecrit la preference « carte graphique "
+               "hautes performances » pour <code>ArcGISPro.exe</code>, dans "
+               "<code>HKCU</code> uniquement.</li>"
+               "</ul>"
+               "<p><b>Chaque correctif applique affiche sa propre commande "
+               "d'annulation</b> dans les messages et dans le rapport. Copiez-"
+               "la avant de fermer la fenetre.</p>")
 
         html_out = arcpy.Parameter(
-            displayName="HTML report",
+            displayName="Rapport HTML",
             name="html_report",
             datatype="GPString",
             parameterType="Derived",
             direction="Output")
+        hinted(html_out,
+               "Sortie : chemin du rapport HTML. Ne se remplit pas a la main.",
+               "<p><b>Sortie derivee</b> : l'outil la remplit lui-meme avec le "
+               "chemin du rapport ecrit.</p>"
+               "<p>Elle existe pour que l'outil puisse etre <b>enchaine</b> "
+               "dans un modele ModelBuilder : un outil suivant peut reprendre "
+               "ce chemin.</p>")
 
         return [out, sde, port, portal, timeout, verbose, text, browser,
                 apply_fixes, html_out]
@@ -343,13 +464,17 @@ class VerifyAnalyser(object):
     """
 
     def __init__(self):
-        self.label = "Verify the analyser (offline self-test)"
+        self.label = "Verifier l'analyseur (autotest hors ligne)"
         self.description = (
-            "Run the analyser's offline assertions over its own decision "
-            "functions, on stand-in workstations, and report how many passed. "
-            "Reads no registry, writes nothing, contacts no host.")
+            "PAS un diagnostic de votre poste. Cet outil verifie le "
+            "FICHIER : il rejoue ses propres assertions sur des postes de "
+            "travail de substitution et dit combien passent. A lancer une "
+            "fois sur une nouvelle machine, avant de croire un rapport - "
+            "cela prouve que la copie qu'on vous a donnee n'est pas "
+            "abimee. Ne lit aucun registre, n'ecrit rien, ne contacte "
+            "aucun hote. Aucun parametre a remplir.")
         self.canRunInBackground = False
-        self.category = "Diagnose"
+        self.category = "Diagnostic"
 
     def getParameterInfo(self):
         result = arcpy.Parameter(
@@ -385,20 +510,24 @@ class VerifyAnalyser(object):
         captured = buffer.getvalue()
         for line in _tail(captured, 25):
             messages.addMessage("  %s" % line)
-        total = len([l for l in captured.splitlines()
-                     if l.startswith(("PASS  ", "FAIL  "))])
-        failed = [l for l in captured.splitlines() if l.startswith("FAIL  ")]
+        lines = captured.splitlines()
+        total = len([l for l in lines if l.startswith(("PASS  ", "FAIL  "))])
+        failed = [l for l in lines if l.startswith("FAIL  ")]
+        not_run = [l for l in lines if l.startswith("SKIP  ")]
+        tail = "" if not not_run else ", %d not run" % len(not_run)
+        for line in not_run:
+            messages.addWarningMessage("  %s" % line)
         if code == 0:
             messages.addMessage(
-                "%d assertions, 0 failed, in %.1f s."
-                % (total, time.time() - started))
-            parameters[0].value = "%d assertions, 0 failed" % total
+                "%d assertions, 0 failed%s, in %.1f s."
+                % (total, tail, time.time() - started))
+            parameters[0].value = "%d assertions, 0 failed%s" % (total, tail)
         else:
             for line in failed:
                 messages.addErrorMessage("  %s" % line)
             messages.addErrorMessage(
-                "%d of %d assertions failed." % (len(failed), total))
-            parameters[0].value = "%d of %d assertions failed" % (
-                len(failed), total)
+                "%d of %d assertions failed%s." % (len(failed), total, tail))
+            parameters[0].value = "%d of %d assertions failed%s" % (
+                len(failed), total, tail)
             raise arcpy.ExecuteError()
         return

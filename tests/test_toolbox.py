@@ -475,6 +475,26 @@ check(params[9].direction == "Output" and params[9].parameterType == "Derived",
 check(params[8].value is False,
       "the fixes are off by default: a caller that never touches that "
       "parameter cannot arm them")
+check(all((getattr(par, "helpMessage", "") or "").strip() for par in params),
+      "every parameter carries a tooltip, so hovering the question mark "
+      "answers what belongs in the box")
+check(all((getattr(par, "parameterHelp", "") or "").strip() for par in params),
+      "and a help-panel paragraph, which is where the default and the "
+      "example live - a display name has to stay short enough to fit "
+      "the pane, so it cannot carry either")
+check("1433" in (params[2].parameterHelp or "")
+      and "4000" in (params[4].parameterHelp or ""),
+      "the numeric parameters name their own default and the values "
+      "actually seen in the field, not just a range")
+check("Laissez vide" in (params[1].parameterHelp or "")
+      and "Laissez vide" in (params[3].parameterHelp or ""),
+      "both network probes say what leaving them empty does, because "
+      "empty is the right answer for most runs and a blank box "
+      "otherwise reads as something forgotten")
+check("Rien n'est supprime" in (params[8].parameterHelp or "")
+      and "annulation" in (params[8].parameterHelp or ""),
+      "the one parameter that changes the machine says so, says nothing "
+      "is deleted, and says an undo is printed")
 
 print("-" * 70)
 print("the toolbox refuses what the analyser's parser refuses")

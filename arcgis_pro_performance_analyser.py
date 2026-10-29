@@ -90,12 +90,16 @@ NOT_MEASURED = (
 # The symptoms the checks map onto, kept generic. An Impact line that does not
 # name one of these is describing a machine, not a complaint.
 SYMPTOMS = (
-    ("S1", "the project opens slowly, minutes rather than seconds"),
-    ("S2", "the session hangs for minutes mid-edit, sometimes to a force-close"),
-    ("S3", "saved edits are silently gone after such a hang (most serious)"),
-    ("S4", "a field-calculated value updates the table but the map does not redraw"),
-    ("S5", "copy or paste of a feature does nothing for many seconds, and "
-           "retries duplicate it"),
+    ("S1", "le projet met des minutes a s'ouvrir au lieu de quelques "
+           "secondes"),
+    ("S2", "la session se fige plusieurs minutes en pleine modification, "
+           "parfois jusqu'a une fermeture forcee"),
+    ("S3", "des modifications enregistrees ont disparu sans message apres "
+           "un tel figeage (le plus grave)"),
+    ("S4", "une valeur recalculee met a jour la table mais la carte ne se "
+           "redessine pas"),
+    ("S5", "un copier ou coller d'entite ne fait rien pendant plusieurs "
+           "secondes, et les tentatives suivantes le dupliquent"),
 )
 
 # Report format version. Bumped when the JSON shape changes, so a diff against
@@ -2568,6 +2572,38 @@ class Env(object):
         candidate = ntpath.join(root, "System32", name)
         return candidate if self.isfile(candidate) else name
 
+    def python_exe(self):
+        """A Python interpreter this process may safely spawn, or None.
+
+        `sys.executable` is not always Python. Run inside ArcGIS Pro it is
+        `C:\\Program Files\\ArcGIS\\Pro\\bin\\ArcGISPro.exe`, so spawning it with
+        `-c` does not evaluate a snippet: it opens a second copy of the
+        application, which ignores the argument, puts up a window on the
+        editor's screen and never exits. A self-test that hangs for two
+        minutes and then dies on TimeoutExpired is what that looks like.
+
+        So the interpreter is resolved by name, and the answer is None when
+        none can be found rather than the host application.
+        """
+        here = sys.executable or ""
+        if os.path.basename(here).lower().startswith("python"):
+            return here
+        name = "python.exe" if self.windows else "python3"
+        for folder in (getattr(sys, "prefix", "") or "",
+                       getattr(sys, "base_prefix", "") or "",
+                       os.path.dirname(here)):
+            if not folder:
+                continue
+            candidate = os.path.join(folder, name)
+            if self.isfile(candidate):
+                return candidate
+            if not self.windows:
+                continue
+            fallback = os.path.join(folder, "python.exe")
+            if fallback != candidate and self.isfile(fallback):
+                return fallback
+        return None
+
     def _run(self, argv, timeout=120):
         """(returncode, stdout text, first stderr line) of one bounded child."""
         import subprocess   # imported here so a plain non-Windows run never
@@ -4885,13 +4921,18 @@ def opts_with(**kwargs):
     return merged
 
 
-def summarize(passed, failed):
-    """The self-test footer as (lines, exit code)."""
+def summarize(passed, failed, skipped=0):
+    """The self-test footer as (lines, exit code).
+
+    Skipped assertions are counted in neither number and are named in the
+    footer, because an assertion that could not run is not one that passed.
+    """
     total = passed + len(failed)
+    tail = "" if not skipped else ", %d skipped" % skipped
     if failed:
-        return (["%d assertions, %d failed" % (total, len(failed))]
+        return (["%d assertions, %d failed%s" % (total, len(failed), tail)]
                 + ["  FAILED: %s" % item for item in failed]), 1
-    return ["%d assertions, 0 failed" % total], 0
+    return ["%d assertions, 0 failed%s" % (total, tail)], 0
 
 
 def self_test():
@@ -4902,6 +4943,7 @@ def self_test():
 
     passed = [0]
     failed = []
+    not_run = [0]   # not 'skipped': that name is rebound below to a record
 
     def check(cond, label):
         if cond:
@@ -4910,6 +4952,15 @@ def self_test():
         else:
             failed.append(label)
             print("FAIL  %s" % label)
+
+    def skip(label, reason):
+        """An assertion this host cannot run, said out loud.
+
+        Not a pass: the count stays honest, and the reason is printed so a
+        reader can tell a host that cannot run it from a host that did not.
+        """
+        not_run[0] += 1
+        print("SKIP  %s -- %s" % (label, reason))
 
     def raises(fn, label, kind=ValueError):
         try:
@@ -6424,7 +6475,7 @@ def self_test():
           "a run with data-loss findings prints the act-first block")
     check("--- DATA LOSS" in text and "--- PERFORMANCE" in text,
           "and both sections")
-    check("S3  saved edits are silently gone" in text,
+    check("S3  des modifications enregistrees ont disparu" in text,
           "the symptom key is printed, so the impact lines can be read")
     check("ACT ON THESE FIRST" not in "\n".join(render(healthy)),
           "a healthy run prints no act-first block at all")
@@ -7559,20 +7610,37 @@ def self_test():
     finally:
         shutil.rmtree(scan_root, ignore_errors=True)
 
-    started = time.time()
-    raises(lambda: winenv._run([sys.executable, "-c",
-                                "import time; time.sleep(30)"], timeout=0.5),
-           "a child that hangs is killed at its timeout and raises, instead "
-           "of holding the run for two minutes",
-           kind=subprocess.TimeoutExpired)
-    check(time.time() - started < 20, "and it was killed, not waited for")
-    check(winenv._run([sys.executable, "-c",
-                       "import sys; sys.stderr.write('oops\\n'); sys.exit(3)"])
-          == (3, "", "oops")
-          and winenv._run([sys.executable, "-c", "import sys; sys.exit(4)"])[2]
-          == "exit code 4",
-          "a child's exit code, output and first error line are returned, "
-          "and a silent failure still gets a reason")
+    # A child is spawned by resolved interpreter, never by sys.executable:
+    # inside ArcGIS Pro that is ArcGISPro.exe, and starting it opens a second
+    # copy of the application instead of running the snippet.
+    py = winenv.python_exe()
+    if py is None:
+        skip("a child that hangs is killed at its timeout and raises",
+             "no Python interpreter to spawn here; sys.executable is %r"
+             % (sys.executable,))
+        skip("and it was killed, not waited for", "nothing was spawned")
+        skip("a child's exit code, output and first error line are returned",
+             "nothing was spawned")
+    else:
+        started = time.time()
+        raises(lambda: winenv._run([py, "-c", "import time; time.sleep(30)"],
+                                   timeout=0.5),
+               "a child that hangs is killed at its timeout and raises, "
+               "instead of holding the run for two minutes",
+               kind=subprocess.TimeoutExpired)
+        check(time.time() - started < 20, "and it was killed, not waited for")
+        check(winenv._run([py, "-c",
+                           "import sys; sys.stderr.write('oops\\n'); "
+                           "sys.exit(3)"], timeout=20) == (3, "", "oops")
+              and winenv._run([py, "-c", "import sys; sys.exit(4)"],
+                              timeout=20)[2] == "exit code 4",
+              "a child's exit code, output and first error line are returned, "
+              "and a silent failure still gets a reason")
+    check(winenv.python_exe() is None
+          or os.path.basename(winenv.python_exe()).lower().startswith("python"),
+          "the interpreter is resolved by name and is never the host "
+          "application: spawning ArcGISPro.exe with -c opens a second copy of "
+          "Pro and hangs until the timeout  <-- pinned defect")
 
     lines, code = summarize(3, ["it broke"])
     check(code == 1 and lines == ["4 assertions, 1 failed",
@@ -7580,6 +7648,9 @@ def self_test():
           "a failing self-test says how many failed, names each, and exits 1")
     check(summarize(2, []) == (["2 assertions, 0 failed"], 0),
           "and a clean one exits 0")
+    check(summarize(2, [], 3) == (["2 assertions, 0 failed, 3 skipped"], 0),
+          "an assertion a host could not run is named in the footer and is "
+          "counted in neither number: a skip is not a pass")
     imported = runpy.run_path(os.path.abspath(__file__),
                               run_name="properf_imported")
     check(callable(imported["main"]),
@@ -7703,7 +7774,7 @@ def self_test():
           "and every one of them printed a line the operator can see")
 
     print("-" * 70)
-    lines, code = summarize(passed[0], failed)
+    lines, code = summarize(passed[0], failed, not_run[0])
     for line in lines:
         print(line)
     return code
