@@ -85,13 +85,12 @@ class Toolbox(object):
         self.label = "ArcGIS Pro Performance Analyser"
         self.alias = "properf"
         self.description = (
-            "Deux outils.  1) Diagnostiquer la lenteur d'ArcGIS Pro : "
-            "celui qu'on lance - il lit ce poste et rend un rapport HTML. "
-            "2) Verifier l'analyseur : un controle du fichier lui-meme, a "
-            "lancer une fois sur une nouvelle machine avant de croire un "
-            "rapport. Lecture seule tant que les correctifs ne sont pas "
-            "coches.")
-        self.tools = [Diagnose, VerifyAnalyser]
+            "Diagnostique pourquoi ArcGIS Pro est lent sur ce poste, et ne "
+            "rapporte jamais une trouvaille que la machine n'a pas "
+            "produite. Rend un rapport HTML, controle par controle : ce qui "
+            "a ete mesure, ce que cela coute a ArcGIS Pro, et quoi faire. "
+            "Lecture seule tant que les correctifs ne sont pas coches.")
+        self.tools = [Diagnose]
         self.canRunInBackground = False
 
 
@@ -451,83 +450,4 @@ class Diagnose(object):
             "names and exclusion paths. Read it before you send it to anyone.")
         messages.addMessage("Analyser exit code %d: %s"
                             % (code, report.EXIT_MEANING.get(code, "?")))
-        return
-
-
-class VerifyAnalyser(object):
-    """Run the analyser's own offline assertions.
-
-    The tool's whole claim is that it never reports a finding the machine did
-    not produce, and that claim is enforced by the engine's own offline
-    assertions over its decision functions. Run this before you trust a report from a new machine.
-    It reads no registry, writes nothing and contacts no host.
-    """
-
-    def __init__(self):
-        self.label = "Verifier l'analyseur (autotest hors ligne)"
-        self.description = (
-            "PAS un diagnostic de votre poste. Cet outil verifie le "
-            "FICHIER : il rejoue ses propres assertions sur des postes de "
-            "travail de substitution et dit combien passent. A lancer une "
-            "fois sur une nouvelle machine, avant de croire un rapport - "
-            "cela prouve que la copie qu'on vous a donnee n'est pas "
-            "abimee. Ne lit aucun registre, n'ecrit rien, ne contacte "
-            "aucun hote. Aucun parametre a remplir.")
-        self.canRunInBackground = False
-        self.category = "Diagnostic"
-
-    def getParameterInfo(self):
-        result = arcpy.Parameter(
-            displayName="Result",
-            name="result",
-            datatype="GPString",
-            parameterType="Derived",
-            direction="Output")
-        return [result]
-
-    def isLicensed(self):
-        return True
-
-    def updateParameters(self, parameters):
-        return
-
-    def updateMessages(self, parameters):
-        return
-
-    def execute(self, parameters, messages):
-        import contextlib
-        import io
-
-        buffer = io.StringIO()
-        started = time.time()
-        try:
-            with contextlib.redirect_stdout(buffer):
-                code = engine.self_test()
-        except Exception as exc:
-            messages.addErrorMessage("The self-test could not run: %s: %s"
-                                     % (type(exc).__name__, exc))
-            raise arcpy.ExecuteError()
-        captured = buffer.getvalue()
-        for line in _tail(captured, 25):
-            messages.addMessage("  %s" % line)
-        lines = captured.splitlines()
-        total = len([l for l in lines if l.startswith(("PASS  ", "FAIL  "))])
-        failed = [l for l in lines if l.startswith("FAIL  ")]
-        not_run = [l for l in lines if l.startswith("SKIP  ")]
-        tail = "" if not not_run else ", %d not run" % len(not_run)
-        for line in not_run:
-            messages.addWarningMessage("  %s" % line)
-        if code == 0:
-            messages.addMessage(
-                "%d assertions, 0 failed%s, in %.1f s."
-                % (total, tail, time.time() - started))
-            parameters[0].value = "%d assertions, 0 failed%s" % (total, tail)
-        else:
-            for line in failed:
-                messages.addErrorMessage("  %s" % line)
-            messages.addErrorMessage(
-                "%d of %d assertions failed%s." % (len(failed), total, tail))
-            parameters[0].value = "%d of %d assertions failed%s" % (
-                len(failed), total, tail)
-            raise arcpy.ExecuteError()
         return

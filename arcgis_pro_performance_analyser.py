@@ -38,6 +38,7 @@ finding bearing on lost edits, 3 no finding but nothing was determined either,
 from __future__ import print_function
 
 import argparse
+import calendar
 import collections
 import json
 import ntpath
@@ -155,6 +156,15 @@ LINK_SPEED_MIN_MBPS = 1000
 # on a machine that is already near its memory ceiling, and a pagefile on a
 # network volume is a stall nobody will find in the Pro logs.
 PAGEFILE_MIN_MB = 4096
+
+# Processor and graphics. Both thresholds are this tool's own allowances, not
+# published Esri figures: Esri's requirement pages are not reachable from
+# here, so nothing in this file claims to quote one.
+CPU_LOGICAL_MIN = 4            # below this, parallel geoprocessing starves
+GPU_DRIVER_MAX_DAYS = 365      # past a year, "update the driver" is the answer
+# Esri's own performance readout names WARP explicitly: it means Pro found no
+# capable GPU and is emulating one on the CPU, which is slow by construction.
+GPU_EMULATED_MARKERS = ("WARP", "BASIC DISPLAY", "MICROSOFT BASIC")
 
 # One directory listing on the project share. These are this tool's
 # allowances, not a published figure: Pro lists folders many times while it
@@ -2691,6 +2701,46 @@ class Env(object):
             "[string]$_.LinkSpeed} }); ConvertTo-Json -Compress -InputObject $a")
         return _ps_rows(data, "name", "speed"), error
 
+    def cpu(self):
+        """([processor rows], None) or (None, reason).
+
+        One row per socket. ArcGIS Pro draws largely on one core, so the clock
+        of a single core matters more than the count of them; both are read
+        because a low count starves parallel geoprocessing instead.
+        """
+        if not self.windows:
+            return None, "the processor is read on Windows only"
+        data, error = self._powershell_json(
+            "$p = @(Get-CimInstance Win32_Processor | ForEach-Object { "
+            "[pscustomobject]@{name = $_.Name; cores = $_.NumberOfCores; "
+            "logical = $_.NumberOfLogicalProcessors; mhz = "
+            "$_.MaxClockSpeed} }); ConvertTo-Json -Compress -InputObject $p")
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            data = [data]
+        return [row for row in data if isinstance(row, dict)], None
+
+    def gpu(self):
+        """([video controller rows], None) or (None, reason).
+
+        The driver date is the finding, not the adapter name: the first thing
+        Esri's own troubleshooting guide asks for is a driver from the GPU
+        maker rather than the one Windows Update offered.
+        """
+        if not self.windows:
+            return None, "the graphics adapter is read on Windows only"
+        data, error = self._powershell_json(
+            "$g = @(Get-CimInstance Win32_VideoController | ForEach-Object { "
+            "[pscustomobject]@{name = $_.Name; driver = $_.DriverVersion; "
+            "date = $(if ($_.DriverDate) { $_.DriverDate.ToString('o') } "
+            "else { $null })} }); ConvertTo-Json -Compress -InputObject $g")
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            data = [data]
+        return [row for row in data if isinstance(row, dict)], None
+
     def pagefile(self):
         """([entries], None) or (None, reason) from the boot-time setting.
 
@@ -3462,6 +3512,212 @@ def probe_overviews(env, facts):
     return decide_overviews(rasters, with_overview, unreadable)
 
 
+def _int_or_none(value):
+    """An int out of one CIM answer, or None. A bool is not a count."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _cpu_row(row):
+    """One processor row coerced, or None when it carries nothing usable."""
+    name = row.get("name")
+    cores = _int_or_none(row.get("cores"))
+    logical = _int_or_none(row.get("logical"))
+    mhz = _int_or_none(row.get("mhz"))
+    if name is None and cores is None and logical is None and mhz is None:
+        return None
+    return {"name": "%s" % (name or "<unnamed processor>"),
+            "cores": cores or 0, "logical": logical or 0, "mhz": mhz or 0}
+
+
+def _driver_age_days(text, now):
+    """Days since a driver date, or None.
+
+    A date that cannot be parsed answers None, never zero: a driver with an
+    unreadable date is not a driver installed today, and reading it as fresh
+    would pass the one check Esri's guide leads with.
+    """
+    if not text:
+        return None
+    try:
+        stamp = calendar.timegm(time.strptime("%s" % text[:10], "%Y-%m-%d"))
+    except (ValueError, OverflowError, TypeError):
+        return None
+    if stamp > now:
+        return None
+    return int((now - stamp) / 86400)
+
+
+def _gpu_row(row, now):
+    """One video controller coerced, or None when it carries nothing usable."""
+    name = row.get("name")
+    driver = row.get("driver")
+    date = row.get("date")
+    if name is None and driver is None and date is None:
+        return None
+    return {"name": "%s" % (name or "<unnamed adapter>"),
+            "driver": "%s" % (driver or "<version not reported>"),
+            "date": date or None,
+            "age_days": _driver_age_days(date, now)}
+
+
+def decide_cpu(rows, error):
+    """PF-28. What the processor is.
+
+    The second machine finding no ArcGIS Pro setting fixes, after the disk.
+    Pro draws largely on one core, so a weak single-core clock reads as an
+    unexplained stall while every setting in the report is correct.
+    """
+    title = "Processor model, cores and clock"
+    expected = ("At least %d logical processors. This threshold is this "
+                "tool's own allowance, not a published Esri figure."
+                % CPU_LOGICAL_MIN)
+    if error:
+        return dict(cid="PF-28", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The processor could not be read: %s. An unread "
+                             "processor is not a processor that is fine."
+                             % error,
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_Processor | "
+                        "Select Name, NumberOfCores, NumberOfLogicalProcessors, "
+                        "MaxClockSpeed.")
+    clean = [r for r in [_cpu_row(x) for x in rows] if r]
+    if not clean:
+        return dict(cid="PF-28", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The processor list came back empty, so nothing "
+                             "was read.",
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_Processor.")
+    logical = sum(r["logical"] for r in clean)
+    cores = sum(r["cores"] for r in clean)
+    clocks = [r["mhz"] for r in clean if r["mhz"]]
+    mhz = max(clocks) if clocks else 0
+    lines = ["%s: %d core(s), %d logical, %s"
+             % (r["name"], r["cores"], r["logical"],
+                ("%.2f GHz" % (r["mhz"] / 1000.0)) if r["mhz"]
+                else "<clock not reported>") for r in clean]
+    lines.append("totals: %d core(s), %d logical processor(s)"
+                 % (cores, logical))
+    status = "Warn" if logical < CPU_LOGICAL_MIN else "Pass"
+    if logical < CPU_LOGICAL_MIN:
+        lines.append("fewer logical processors than this tool's allowance")
+    return dict(
+        cid="PF-28", category="Hardware", status=status, title=title,
+        observed=lines, expected=expected,
+        impact="S1 and S2. ArcGIS Pro draws largely on one core, so a weak "
+               "single-core clock shows up as a stall no setting explains; "
+               "the core count starves parallel geoprocessing instead.",
+        fix="Hardware is not configurable, so act on what is: close other "
+            "applications before a heavy session, set the power plan to High "
+            "performance (PF-15), and pin ArcGISPro.exe to the "
+            "high-performance GPU (PF-11). When specifying a machine, favour "
+            "single-core clock over core count. Do not buy hardware off this "
+            "one line.",
+        kpi={"cores": cores, "logical": logical,
+             "max_ghz": round(mhz / 1000.0, 2)})
+
+
+def decide_gpu(rows, error, now):
+    """PF-29. The graphics adapter and how old its driver is.
+
+    Updating the driver from the GPU maker is the first thing Esri's own
+    troubleshooting guide asks for, and it is the one cause on this list that
+    presents as a crash rather than as a slowdown.
+    """
+    title = "Graphics adapter and driver age"
+    expected = ("A driver from the GPU maker, less than %d days old. This "
+                "threshold is this tool's own allowance, not a published Esri "
+                "figure." % GPU_DRIVER_MAX_DAYS)
+    if error:
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The graphics adapter could not be read: %s. An "
+                             "unread adapter is not an adapter that is fine."
+                             % error,
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_VideoController "
+                        "| Select Name, DriverVersion, DriverDate.")
+    clean = [r for r in [_gpu_row(x, now) for x in rows] if r]
+    if not clean:
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The adapter list came back empty, so nothing was "
+                             "read.",
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_VideoController.")
+    lines = ["%s: driver %s, dated %s"
+             % (r["name"], r["driver"],
+                ("%d day(s) old" % r["age_days"]) if r["age_days"] is not None
+                else "<date not readable>") for r in clean]
+    emulated = [r for r in clean
+                if any(m in r["name"].upper() for m in GPU_EMULATED_MARKERS)]
+    if emulated:
+        lines.append("emulated on the CPU: %s"
+                     % ", ".join(r["name"] for r in emulated))
+        return dict(
+            cid="PF-29", category="Hardware", status="Fail", title=title,
+            observed=lines, expected=expected,
+            impact="S2 and S4. Pro found no capable GPU and is emulating one "
+                   "on the CPU, which is slow by construction and is the "
+                   "single most common cause of a session that hangs on draw.",
+            fix="Install the driver from the GPU maker's own site - NVIDIA, "
+                "AMD or Intel - not the one Windows Update offers. On a "
+                "laptop, take it from the laptop maker instead. Then pin "
+                "ArcGISPro.exe to that GPU (PF-11). If Pro still reports "
+                "WARP, the card or its driver does not support the required "
+                "capabilities and switching the rendering engine to OpenGL "
+                "(PF-05) is the next step.")
+    ages = [r["age_days"] for r in clean if r["age_days"] is not None]
+    newest = min(ages) if ages else None
+    if newest is None:
+        lines.append("no driver date could be read, so no age was computed")
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title, observed=lines,
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read the driver date in Device Manager > Display "
+                        "adapters > Driver, and compare it with the GPU "
+                        "maker's site.")
+    status = "Warn" if newest > GPU_DRIVER_MAX_DAYS else "Pass"
+    if status == "Warn":
+        lines.append("newest driver is %d day(s) old, past this tool's "
+                     "allowance" % newest)
+    return dict(
+        cid="PF-29", category="Hardware", status=status, title=title,
+        observed=lines, expected=expected,
+        impact="S2 and S4. A stale driver is the first thing Esri's own "
+               "troubleshooting guide asks about, and on this list it is the "
+               "one that presents as a crash rather than as a slowdown.",
+        fix="Update the driver from the GPU maker's own site - NVIDIA, AMD or "
+            "Intel - not from Windows Update, which often carries an older "
+            "one. On a laptop, take it from the laptop maker. If crashes "
+            "began right after a driver update, roll that update back: it is "
+            "a known cause, and rolling back is a legitimate fix rather than "
+            "a step backwards.",
+        kpi={"driver_age_days": newest})
+
+
+def probe_cpu(env, facts):
+    rows, error = env.cpu()
+    return decide_cpu(rows or [], error)
+
+
+def probe_gpu(env, facts):
+    rows, error = env.gpu()
+    return decide_gpu(rows or [], error, env.now())
+
+
 def probe_disk_media(env, facts):
     disks, error = env.disk_media()
     return decide_disk_media(disks or [], error)
@@ -4141,6 +4397,10 @@ def registrations(env, facts, opts):
          lambda: probe_roaming(env, facts)),
         ("PF-27", "Display", "Symbology refresh (S4)", False,
          lambda: probe_symbology(env, facts)),
+        ("PF-28", "Hardware", "Processor model, cores and clock", False,
+         lambda: probe_cpu(env, facts)),
+        ("PF-29", "Hardware", "Graphics adapter and driver age", False,
+         lambda: probe_gpu(env, facts)),
     ]
 
 
@@ -4595,6 +4855,13 @@ class FakeEnv(Env):
         data, error = self._answer("link_speed")
         return _ps_rows(data, "name", "speed"), error
 
+    def cpu(self):
+        return self._answer("cpu")
+
+    def gpu(self):
+        return self._answer("gpu")
+
+
     def events(self, log, query, count):
         return self._events.get(log, (None, "no such log on the stand-in "
                                             "machine"))
@@ -4785,6 +5052,11 @@ def fake_healthy():
             "disk_media": ([{"name": "SAMSUNG SSD 980 PRO", "media": "SSD"}],
                            None),
             "link_speed": ([{"name": "Ethernet", "speed": "1 Gbps"}], None),
+            "cpu": ([{"name": "Intel Core i7-11800H", "cores": 8,
+                      "logical": 16, "mhz": 2304}], None),
+            "gpu": ([{"name": "NVIDIA GeForce RTX 3060",
+                      "driver": "31.0.15.3623", "date": "2023-10-01"}],
+                    None),
             "smb": ({"EnableMultiChannel": True,
                      "RequireSecuritySignature": False,
                      "DirectoryCacheLifetime": 10,
@@ -4885,6 +5157,11 @@ def fake_sick():
             "link_speed": ([{"name": "Wi-Fi", "speed": "866 Mbps"},
                             {"name": "Ethernet 2", "speed": "100 Mbps"}],
                            None),
+            "cpu": ([{"name": "Intel Core i5-8250U", "cores": 2,
+                      "logical": 2, "mhz": 1608}], None),
+            "gpu": ([{"name": "Intel UHD Graphics 620",
+                      "driver": "27.20.100.8681", "date": "2022-01-10"}],
+                    None),
             "smb": ({"EnableMultiChannel": False,
                      "RequireSecuritySignature": True,
                      "DirectoryCacheLifetime": 10,
@@ -5741,6 +6018,76 @@ def self_test():
     check(decide_link_speed([], "access denied")["status"] == "Info",
           "and an unread adapter list is Info")
 
+    check(decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                       "mhz": 2304}], None)["status"] == "Pass",
+          "a sixteen-logical processor passes the allowance this tool sets")
+    check(decide_cpu([{"name": "i5", "cores": 2, "logical": 2,
+                       "mhz": 1608}], None)["status"] == "Warn",
+          "and two logical processors warn: Pro draws largely on one core, so "
+          "a weak clock reads as a stall no setting explains")
+    check(decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                       "mhz": 2304}], None)["kpi"]["logical"] == 16,
+          "the core count is carried as a number so the report can gauge it")
+    check(decide_cpu([{"name": None, "cores": None, "logical": None,
+                       "mhz": None}], None)["status"] == "Info",
+          "a processor row carrying nothing at all is Info, not a Pass on "
+          "zeroes  <-- pinned defect")
+    check(decide_cpu([], "access denied")["status"] == "Info"
+          and decide_cpu([], None)["status"] == "Info",
+          "an unread processor list and an empty one are both Info")
+    check(_int_or_none(True) is None and _int_or_none(" 12 ") == 12
+          and _int_or_none("twelve") is None,
+          "a count is parsed from a CIM string, and a bool is never read as "
+          "a count  <-- pinned defect")
+
+    check(_driver_age_days("2023-10-01T00:00:00.0000000+01:00",
+                           1700000000.0) == 44,
+          "a driver date is read as an age in days, and the CIM offset "
+          "suffix does not break it")
+    check(_driver_age_days("garbage", 1700000000.0) is None
+          and _driver_age_days(None, 1700000000.0) is None,
+          "an unreadable date answers nothing rather than zero: read as zero "
+          "it would pass the one check Esri's own guide leads with "
+          "<-- pinned defect")
+    check(_driver_age_days("2030-01-01", 1700000000.0) is None,
+          "and a date in the future answers nothing rather than a negative "
+          "age that would always pass")
+    check(decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                       "driver": "31.0.15.3623",
+                       "date": "2023-10-01"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "a driver a few weeks old passes")
+    check(decide_gpu([{"name": "Intel UHD Graphics 620",
+                       "driver": "27.20.100.8681",
+                       "date": "2022-01-10"}], None, 1700000000.0)["status"]
+          == "Warn",
+          "and a driver more than a year old warns: Esri's troubleshooting "
+          "guide asks for a driver from the GPU maker as its first step")
+    warp = decide_gpu([{"name": "Microsoft Basic Render Driver (WARP)",
+                        "driver": "10.0", "date": "2023-10-01"}],
+                      None, 1700000000.0)
+    check(warp["status"] == "Fail" and "emulating" in warp["impact"],
+          "WARP is a Fail and says Pro is emulating a GPU on the CPU: it is "
+          "the most common cause of a session that hangs on draw "
+          "<-- pinned defect")
+    no_date = decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                           "driver": "31.0", "date": None}],
+                         None, 1700000000.0)
+    check(no_date["status"] == "Info" and no_date["measured"] is False,
+          "a driver with no readable date is Info and unmeasured, not a Pass "
+          "on an age of zero  <-- pinned defect")
+    check(decide_gpu([], "access denied", 1700000000.0)["status"] == "Info"
+          and decide_gpu([], None, 1700000000.0)["status"] == "Info",
+          "an unread adapter list and an empty one are both Info")
+    check(decide_gpu([{"name": "NVIDIA GeForce RTX 3060", "driver": "31.0",
+                       "date": "2023-10-01"},
+                      {"name": "Intel UHD Graphics", "driver": "31.0",
+                       "date": "2022-01-10"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "with a discrete GPU and an integrated one, the newest driver "
+          "decides: pinning ArcGISPro.exe to the discrete card is the fix "
+          "<-- pinned defect")
+
     check(_ps_rows({"name": "one", "media": "SSD"}, "name", "media")
           == [("one", "SSD")],
           "a single PowerShell row is unwrapped: ConvertTo-Json drops the "
@@ -6123,6 +6470,7 @@ def self_test():
         # refusal working, and it is pinned rather than assumed.
         "PF-01": "Info", "PF-09": "Info", "PF-10": "Info", "PF-14": "Info",
         "PF-16": "Warn", "PF-18": "Warn", "PF-20": "Warn", "PF-21": "Warn",
+        "PF-28": "Warn", "PF-29": "Warn",
     }
     for cid in sorted(expected_run):
         check(got.get(cid) == expected_run[cid],

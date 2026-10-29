@@ -455,15 +455,20 @@ print("-" * 70)
 print("the .pyt loads and its tools are what ArcGIS Pro will see")
 pyt = load_pyt()
 box = pyt.Toolbox()
-check(box.alias == "properf" and len(box.tools) == 2,
-      "the toolbox exposes two tools under one alias")
+check(box.alias == "properf" and len(box.tools) == 1,
+      "the toolbox exposes exactly one tool: the offline self-test was "
+      "dropped from the pane because a second tool that is not a "
+      "diagnostic of the workstation only invites the wrong one to be "
+      "run. It stays on the command line as --self-test")
 check(box.canRunInBackground is False,
       "neither runs in the background: the diagnostic reads the session it "
       "runs in, and DL-12 asks whether Pro is open")
 diagnose = pyt.Diagnose()
-verify = pyt.VerifyAnalyser()
-check(diagnose.canRunInBackground is False and verify.canRunInBackground is False,
-      "and each tool says so itself")
+check(diagnose.canRunInBackground is False,
+      "and the tool says so itself")
+check(not hasattr(pyt, "VerifyAnalyser"),
+      "and the self-test tool is gone from the shipped file, not merely "
+      "hidden from the list")
 params = diagnose.getParameterInfo()
 names = [p.name for p in params]
 check(names == ["output_folder", "sde_server", "sde_port", "portal", "timeout",
@@ -610,27 +615,6 @@ try:
           "only the messages can tell a lost-edits finding from a clean run")
     check(any(l.startswith("APPLIED") for l in m4.warn) is False,
           "and still nothing was applied, with the fixes unticked")
-finally:
-    shutil.rmtree(folder, ignore_errors=True)
-
-print("-" * 70)
-print("the self-test tool drives the analyser's own assertions")
-folder = tempfile.mkdtemp()
-try:
-    v = pyt.VerifyAnalyser()
-    vp = v.getParameterInfo()
-    vm = _Messages()
-    buffer = io.StringIO()
-    real = sys.stdout
-    sys.stdout = buffer
-    try:
-        v.execute(vp, vm)
-    finally:
-        sys.stdout = real
-    check("0 failed" in (vp[0].value or ""),
-          "the self-test tool reports the analyser's own assertion count: %s"
-          % vp[0].value)
-    check(not vm.err, "and no assertion failed")
 finally:
     shutil.rmtree(folder, ignore_errors=True)
 

@@ -12,7 +12,7 @@ le poste où le fichier atterrit.
 
 | Fichier | Rôle |
 |---|---|
-| `ArcGISPro_PerformanceAnalyser.pyt` | **L'artefact livré.** Deux outils, moteur et rendu inclus |
+| `ArcGISPro_PerformanceAnalyser.pyt` | **L'artefact livré.** Un outil, moteur et rendu inclus |
 | `arcgis_pro_performance_analyser.py` | Le moteur de diagnostic et sa ligne de commande. Sans `arcpy` |
 | `html_report.py` | Le rendu HTML. Fonction pure sur le document de rapport, sans `arcpy` |
 | `toolbox_glue.py` | L'interface ArcGIS Pro. La seule partie qui importe `arcpy` |
@@ -36,14 +36,14 @@ module, parce que l'une masquerait l'autre silencieusement.
    exemple `C:\GIS\Tools\`.
 2. Dans ArcGIS Pro : volet **Catalogue → Toolboxes → Add Toolbox**, pointer sur
    ce fichier.
-3. Les deux outils apparaissent sous **« ArcGIS Pro Performance Analyser »**.
+3. L'outil apparaît sous **« ArcGIS Pro Performance Analyser »**.
 
 C'est tout : il n'y a pas d'étape 4. Prérequis : ArcGIS Pro 3.x (Python 3.9+),
 bibliothèque standard uniquement.
 
-## Les deux outils
+## L'outil
 
-### 1. Diagnostiquer la lenteur d'ArcGIS Pro
+### Diagnostiquer la lenteur d'ArcGIS Pro
 
 **C'est l'outil à lancer.**
 
@@ -86,19 +86,23 @@ le rapport. Copiez-la avant de fermer la fenêtre.
 Le chemin du HTML est un **paramètre de sortie dérivé** : l'outil peut être
 enchaîné dans un modèle ModelBuilder.
 
-### 2. Vérifier l'analyseur (autotest hors ligne)
+### L'autotest hors ligne n'est plus dans la boîte à outils
 
-**Ce n'est pas un diagnostic de votre poste.** Cet outil vérifie le *fichier* :
-il rejoue les assertions internes du moteur sur des postes de travail de
-substitution (710 assertions) et dit combien passent. Aucun paramètre à
-remplir. Ne lit aucun registre, n'écrit rien, ne contacte aucun hôte.
+Une version précédente livrait un second outil, « Vérifier l'analyseur ». Il ne
+lisait **rien** sur le poste : il vérifiait le *fichier*, en rejouant les
+assertions internes du moteur sur des postes de travail de substitution. Le
+confondre avec un diagnostic était facile, et cette confusion coûte plus cher
+que la garantie ne rapporte : **l'outil a été retiré de la boîte à outils.**
 
-À lancer **une fois** sur une nouvelle machine, avant de croire un rapport :
-cela prouve que la copie qu'on vous a donnée n'est pas abîmée.
+Il reste disponible en ligne de commande, pour le développement :
 
-Une assertion que cette machine ne peut pas lancer est annoncée
-`SKIP` avec sa raison, et comptée dans **aucun** des deux nombres : un
-contrôle non exécuté n'est pas un contrôle réussi.
+```
+python arcgis_pro_performance_analyser.py --self-test   # 727 assertions
+```
+
+Une assertion que la machine ne peut pas lancer est annoncée `SKIP` avec sa
+raison, et comptée dans **aucun** des deux nombres : un contrôle non exécuté
+n'est pas un contrôle réussi.
 
 > **Défaut corrigé.** Une version précédente lançait ses processus de test avec
 > `sys.executable`. Sous ArcGIS Pro, `sys.executable` n'est **pas** `python.exe`
@@ -223,8 +227,8 @@ rapport le dit.
 ## Vérifier
 
 ```
-python tests/test_toolbox.py      # 87 assertions : rendu, interface et .pyt généré
-python arcgis_pro_performance_analyser.py --self-test   # 710 assertions sur le diagnostic
+python tests/test_toolbox.py      # 86 assertions : rendu, interface et .pyt généré
+python arcgis_pro_performance_analyser.py --self-test   # 727 assertions sur le diagnostic
 python build_toolbox.py --check   # le .pyt livré est bien ce que ses sources produisent
 ```
 
