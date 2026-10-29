@@ -43,34 +43,72 @@ bibliothèque standard uniquement.
 
 ## Les deux outils
 
-### 1. Diagnose ArcGIS Pro slowness
+### 1. Diagnostiquer la lenteur d'ArcGIS Pro
+
+**C'est l'outil à lancer.**
 
 Lit le poste et écrit `arcgis_pro_performance_analyser_<horodatage>.html`,
 `.json` et `.txt` dans le dossier de sortie, puis ouvre le HTML dans le
 navigateur par défaut.
 
-| Paramètre | Défaut | Effet |
+**Pour un premier passage, ne remplissez rien** : les valeurs par défaut
+suffisent, et aucun hôte ne sera contacté.
+
+| Paramètre | Défaut | Ce qu'il faut mettre |
 |---|---|---|
-| Output folder | `<scratch>\ArcGISPro_PerformanceAnalyser` | Où écrire les trois fichiers |
-| Enterprise geodatabase host to probe | vide | Sonde TCP bornée, connect uniquement, sans identifiant. Vide = aucun hôte contacté |
-| Geodatabase port | 1433 | Port de cette sonde |
-| Portal host to probe | vide | Sonde TCP sur 443 |
-| Probe timeout (ms) | 4000 | Borne de chaque sonde |
-| Verbose | décoché | Ajoute le texte « attendu » et les lignes de preuve |
-| Also write the plain-text report | coché | Écrit aussi le `.txt` |
-| Open the HTML report in the default browser | coché | Ouvre le rapport |
-| Apply the gated fixes | **décoché** | Seul paramètre qui modifie la machine |
+| Dossier de sortie | `<scratch>\ArcGISPro_PerformanceAnalyser` | Rien, ou un dossier **local** comme `C:\Temp\diag`. Jamais un partage réseau |
+| Hôte de la géodatabase d'entreprise à sonder | vide | **Vide si vous ne savez pas.** Sinon le serveur nommé dans vos `.sde`, ex. `gisdb01` |
+| Port de la géodatabase | 1433 | 1433 SQL Server, 1521 Oracle, 5432 PostgreSQL. Dans le doute, laissez 1433 |
+| Hôte du portail à sonder (port 443) | vide | **Vide si vous ne savez pas.** Ex. `gis.monorg.ch` ou `www.arcgis.com` |
+| Délai des sondes (ms) | 4000 | Une **borne**, pas une attente : une sonde qui répond en 40 ms rend la main aussitôt |
+| Détaillé | décoché | À cocher quand il faut **prouver** un résultat : ajoute la valeur attendue et la ligne brute lue |
+| Écrire aussi le rapport texte | coché | Le `.txt` est le format à coller dans un ticket |
+| Ouvrir le rapport HTML dans le navigateur | coché | À décocher dans un modèle ModelBuilder |
+| Appliquer les correctifs | **décoché** | **Seul paramètre qui modifie la machine.** Voir ci-dessous |
+
+Chaque paramètre porte une **infobulle** (le point d'interrogation) et un
+**paragraphe d'aide** dans le panneau d'aide de l'outil, avec son défaut et
+un exemple.
+
+**Si vous cochez « Appliquer les correctifs »**, deux correctifs seulement,
+et chacun seulement si son propre contrôle l'a justifié :
+
+- **AP-01** renomme le dossier de cache ESRI en lui ajoutant
+  `.properf-<date>`. **Rien n'est supprimé** : l'ancien dossier reste sur le
+  disque et Pro en reconstruit un neuf. Refusé depuis Pro, qui tient ce
+  dossier.
+- **AP-02** écrit la préférence « carte graphique hautes performances » pour
+  `ArcGISPro.exe`, dans `HKCU` uniquement.
+
+Chacun affiche **sa propre commande d'annulation** dans les messages et dans
+le rapport. Copiez-la avant de fermer la fenêtre.
 
 Le chemin du HTML est un **paramètre de sortie dérivé** : l'outil peut être
 enchaîné dans un modèle ModelBuilder.
 
-### 2. Verify the analyser (offline self-test)
+### 2. Vérifier l'analyseur (autotest hors ligne)
 
-Lance les assertions internes du moteur sur des postes de travail de
-substitution (708 assertions). Ne lit aucun registre, n'écrit rien, ne contacte
-aucun hôte. À lancer avant de faire confiance à un rapport sur une nouvelle
-machine : cela vérifie que le fichier qu'on vous a donné passe toujours ses
-propres tests.
+**Ce n'est pas un diagnostic de votre poste.** Cet outil vérifie le *fichier* :
+il rejoue les assertions internes du moteur sur des postes de travail de
+substitution (710 assertions) et dit combien passent. Aucun paramètre à
+remplir. Ne lit aucun registre, n'écrit rien, ne contacte aucun hôte.
+
+À lancer **une fois** sur une nouvelle machine, avant de croire un rapport :
+cela prouve que la copie qu'on vous a donnée n'est pas abîmée.
+
+Une assertion que cette machine ne peut pas lancer est annoncée
+`SKIP` avec sa raison, et comptée dans **aucun** des deux nombres : un
+contrôle non exécuté n'est pas un contrôle réussi.
+
+> **Défaut corrigé.** Une version précédente lançait ses processus de test avec
+> `sys.executable`. Sous ArcGIS Pro, `sys.executable` n'est **pas** `python.exe`
+> mais `C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe` : l'autotest ouvrait donc
+> une seconde copie d'ArcGIS Pro à l'écran de l'éditrice, laquelle ignorait
+> l'argument et ne se terminait jamais — d'où un échec `TimeoutExpired` après
+> deux minutes. L'interpréteur est maintenant **résolu par son nom**, et
+> l'autotest annonce `SKIP` plutôt que de lancer ce qui n'est pas un
+> interpréteur. L'outil de diagnostic n'a jamais été touché : il ne lance que
+> `powershell.exe` et `wevtutil.exe`, par leur chemin complet dans `System32`.
 
 ## ⚠️ À lire avant d'interpréter un résultat lancé depuis Pro
 
@@ -165,11 +203,28 @@ l'élément `<script>` en avance. Le JSON se décode toujours à l'identique.
 `tests/test_toolbox.py` le vérifie sur un document où chaque champ est un
 payload.
 
+## Sources
+
+Les seuils de cet outil sont **les siens** : ce sont des tolérances choisies pour
+décider « conforme / à surveiller », pas des limites publiées par Esri. Ce qui
+suit est la documentation Esri consultée pour écrire les pistes de correction,
+avec ce qu'elle apporte réellement ici.
+
+| Source | Ce qu'on y prend |
+|---|---|
+| [Settings that affect data access performance](https://doc.esri.com/en/arcgis-pro/latest/get-started/layer-map-project-perf-optimization.html) — documentation officielle ArcGIS Pro 3.7 | Reprojection à la volée quand les données ne sont pas dans la même référence spatiale (PF-01) ; coût des jointures et des requêtes de définition non sélectives (PF-14) ; poids des étiquettes et des `feature weights` (PF-14) ; intérêt des plages d'échelle de visibilité |
+| [Troubleshooting Performance Issues in ArcGIS Pro](https://community.esri.com/t5/arcgis-pro-documents/troubleshooting-performance-issues-in-arcgis-pro/ta-p/1025516) — Esri Community | Pilote de carte graphique à prendre chez le fabricant ; antivirus à écarter temporairement pour isoler la cause (PF-17) ; `WARP` dans le readout = Pro émule la carte graphique sur le processeur ; historique de géotraitement stocké dans le `.aprx` (PF-10) ; ne garder ouverts que les cartes et mises en page utiles (PF-10) |
+| [Why is ArcGIS Pro so slow?](https://community.esri.com/t5/arcgis-pro-questions/why-is-arcgis-pro-so-slow/td-p/508005/page/5) — Esri Community | Renommer les dossiers `ESRI` de `AppData\Local` et `AppData\Roaming` pour tester le cache (AP-01) ; autoriser `ArcGISPro.exe` dans le pare-feu Windows Defender ; latence réseau et données locales contre données en partage |
+
+Ces pages ont été **relues lors de cette modification**. Elles ne sont pas
+citées dans le code : les seuils chiffrés de l'outil restent les siens, et le
+rapport le dit.
+
 ## Vérifier
 
 ```
-python tests/test_toolbox.py      # 82 assertions : rendu, interface et .pyt généré
-python arcgis_pro_performance_analyser.py --self-test   # 708 assertions sur le diagnostic
+python tests/test_toolbox.py      # 87 assertions : rendu, interface et .pyt généré
+python arcgis_pro_performance_analyser.py --self-test   # 710 assertions sur le diagnostic
 python build_toolbox.py --check   # le .pyt livré est bien ce que ses sources produisent
 ```
 

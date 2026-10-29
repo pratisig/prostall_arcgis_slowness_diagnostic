@@ -220,7 +220,7 @@ exercises the reading layer itself against a real temporary directory and a real
 and runs the whole tool once, read-only, on the machine you run it on. That run is captured, not
 printed.
 
-The same 708 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
+The same 710 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
 labels. That matters more than it sounds: the path logic answers questions about Windows paths,
 and two of the bugs it pins are cases where the standard library answers for the host instead of
 for the path. The reads that only exist on Windows are run twice, once with the platform switched
@@ -503,7 +503,7 @@ missing on the machine it lands on.
 | `html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
 | `toolbox_glue.py` | The ArcGIS Pro glue. The only part that imports `arcpy` |
 | `build_toolbox.py` | Assembles those three into the one `.pyt` |
-| `tests/test_toolbox.py` | 82 assertions over all of it, on a stand-in `arcpy` |
+| `tests/test_toolbox.py` | 87 assertions over all of it, on a stand-in `arcpy` |
 
 Install by copying that one `.pyt` anywhere stable, then Catalog pane > Toolboxes > Add Toolbox,
 pointing at it. The two tools appear under "ArcGIS Pro Performance Analyser".
@@ -557,8 +557,8 @@ workstation report minus the project-file checks. For the full set, close Pro an
 it was.
 
 ```
-python tests/test_toolbox.py      # 82 assertions over the renderer, the glue and the built .pyt
-python arcgis_pro_performance_analyser.py --self-test   # 708 assertions over the diagnostic
+python tests/test_toolbox.py      # 87 assertions over the renderer, the glue and the built .pyt
+python arcgis_pro_performance_analyser.py --self-test   # 710 assertions over the diagnostic
 python build_toolbox.py --check   # the shipped .pyt is what its three sources build to
 ```
 

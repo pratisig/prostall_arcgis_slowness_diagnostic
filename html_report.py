@@ -67,13 +67,16 @@ EXIT_MEANING = {
 # The symptom key the analyser writes into its impact lines. Reproduced here so
 # the flags on the page agree with the letters in the text.
 SYMPTOM_FALLBACK = (
-    ("S1", "the project opens slowly, minutes rather than seconds"),
-    ("S2", "the session hangs for minutes mid-edit, sometimes to a force-close"),
-    ("S3", "saved edits are silently gone after such a hang (most serious)"),
-    ("S4", "a field-calculated value updates the table but the map does not "
-           "redraw"),
-    ("S5", "copy or paste of a feature does nothing for many seconds, and "
-           "retries duplicate it"),
+    ("S1", "le projet met des minutes a s'ouvrir au lieu de quelques "
+           "secondes"),
+    ("S2", "la session se fige plusieurs minutes en pleine modification, "
+           "parfois jusqu'a une fermeture forcee"),
+    ("S3", "des modifications enregistrees ont disparu sans message apres "
+           "un tel figeage (le plus grave)"),
+    ("S4", "une valeur recalculee met a jour la table mais la carte ne se "
+           "redessine pas"),
+    ("S5", "un copier ou coller d'entite ne fait rien pendant plusieurs "
+           "secondes, et les tentatives suivantes le dupliquent"),
 )
 
 # What each finding costs the score. A finding that bears on lost edits costs

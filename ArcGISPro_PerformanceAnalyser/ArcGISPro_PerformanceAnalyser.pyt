@@ -46,16 +46,16 @@ applied change prints its own undo command, and nothing deletes anything.
 
 Provenance
 ----------
-  arcgis_pro_performance_analyser.py        7865 lines  sha256:32f28490189c
-  html_report.py                             871 lines  sha256:6244912c1e5c
-  toolbox_glue.py                            404 lines  sha256:28e70755eaec
+  arcgis_pro_performance_analyser.py        7936 lines  sha256:8739cf873d56
+  html_report.py                             874 lines  sha256:55de8bc2d7fc
+  toolbox_glue.py                            533 lines  sha256:238f270b063c
 """
 
 from __future__ import print_function
 
 # ============================================================================
 # 1/3  diagnostic engine
-# source: arcgis_pro_performance_analyser.py  (sha256:32f28490189c)
+# source: arcgis_pro_performance_analyser.py  (sha256:8739cf873d56)
 # ----------------------------------------------------------------------------
 # r"""Diagnose why ArcGIS Pro is slow on this workstation, and never report a finding the machine did not produce.
 #
@@ -149,12 +149,16 @@ NOT_MEASURED = (
 # The symptoms the checks map onto, kept generic. An Impact line that does not
 # name one of these is describing a machine, not a complaint.
 SYMPTOMS = (
-    ("S1", "the project opens slowly, minutes rather than seconds"),
-    ("S2", "the session hangs for minutes mid-edit, sometimes to a force-close"),
-    ("S3", "saved edits are silently gone after such a hang (most serious)"),
-    ("S4", "a field-calculated value updates the table but the map does not redraw"),
-    ("S5", "copy or paste of a feature does nothing for many seconds, and "
-           "retries duplicate it"),
+    ("S1", "le projet met des minutes a s'ouvrir au lieu de quelques "
+           "secondes"),
+    ("S2", "la session se fige plusieurs minutes en pleine modification, "
+           "parfois jusqu'a une fermeture forcee"),
+    ("S3", "des modifications enregistrees ont disparu sans message apres "
+           "un tel figeage (le plus grave)"),
+    ("S4", "une valeur recalculee met a jour la table mais la carte ne se "
+           "redessine pas"),
+    ("S5", "un copier ou coller d'entite ne fait rien pendant plusieurs "
+           "secondes, et les tentatives suivantes le dupliquent"),
 )
 
 # Report format version. Bumped when the JSON shape changes, so a diff against
@@ -2627,6 +2631,38 @@ class Env(object):
         candidate = ntpath.join(root, "System32", name)
         return candidate if self.isfile(candidate) else name
 
+    def python_exe(self):
+        """A Python interpreter this process may safely spawn, or None.
+
+        `sys.executable` is not always Python. Run inside ArcGIS Pro it is
+        `C:\\Program Files\\ArcGIS\\Pro\\bin\\ArcGISPro.exe`, so spawning it with
+        `-c` does not evaluate a snippet: it opens a second copy of the
+        application, which ignores the argument, puts up a window on the
+        editor's screen and never exits. A self-test that hangs for two
+        minutes and then dies on TimeoutExpired is what that looks like.
+
+        So the interpreter is resolved by name, and the answer is None when
+        none can be found rather than the host application.
+        """
+        here = sys.executable or ""
+        if os.path.basename(here).lower().startswith("python"):
+            return here
+        name = "python.exe" if self.windows else "python3"
+        for folder in (getattr(sys, "prefix", "") or "",
+                       getattr(sys, "base_prefix", "") or "",
+                       os.path.dirname(here)):
+            if not folder:
+                continue
+            candidate = os.path.join(folder, name)
+            if self.isfile(candidate):
+                return candidate
+            if not self.windows:
+                continue
+            fallback = os.path.join(folder, "python.exe")
+            if fallback != candidate and self.isfile(fallback):
+                return fallback
+        return None
+
     def _run(self, argv, timeout=120):
         """(returncode, stdout text, first stderr line) of one bounded child."""
         import subprocess   # imported here so a plain non-Windows run never
@@ -4944,13 +4980,18 @@ def opts_with(**kwargs):
     return merged
 
 
-def summarize(passed, failed):
-    """The self-test footer as (lines, exit code)."""
+def summarize(passed, failed, skipped=0):
+    """The self-test footer as (lines, exit code).
+
+    Skipped assertions are counted in neither number and are named in the
+    footer, because an assertion that could not run is not one that passed.
+    """
     total = passed + len(failed)
+    tail = "" if not skipped else ", %d skipped" % skipped
     if failed:
-        return (["%d assertions, %d failed" % (total, len(failed))]
+        return (["%d assertions, %d failed%s" % (total, len(failed), tail)]
                 + ["  FAILED: %s" % item for item in failed]), 1
-    return ["%d assertions, 0 failed" % total], 0
+    return ["%d assertions, 0 failed%s" % (total, tail)], 0
 
 
 def self_test():
@@ -4961,6 +5002,7 @@ def self_test():
 
     passed = [0]
     failed = []
+    not_run = [0]   # not 'skipped': that name is rebound below to a record
 
     def check(cond, label):
         if cond:
@@ -4969,6 +5011,15 @@ def self_test():
         else:
             failed.append(label)
             print("FAIL  %s" % label)
+
+    def skip(label, reason):
+        """An assertion this host cannot run, said out loud.
+
+        Not a pass: the count stays honest, and the reason is printed so a
+        reader can tell a host that cannot run it from a host that did not.
+        """
+        not_run[0] += 1
+        print("SKIP  %s -- %s" % (label, reason))
 
     def raises(fn, label, kind=ValueError):
         try:
@@ -6483,7 +6534,7 @@ def self_test():
           "a run with data-loss findings prints the act-first block")
     check("--- DATA LOSS" in text and "--- PERFORMANCE" in text,
           "and both sections")
-    check("S3  saved edits are silently gone" in text,
+    check("S3  des modifications enregistrees ont disparu" in text,
           "the symptom key is printed, so the impact lines can be read")
     check("ACT ON THESE FIRST" not in "\n".join(render(healthy)),
           "a healthy run prints no act-first block at all")
@@ -7618,20 +7669,37 @@ def self_test():
     finally:
         shutil.rmtree(scan_root, ignore_errors=True)
 
-    started = time.time()
-    raises(lambda: winenv._run([sys.executable, "-c",
-                                "import time; time.sleep(30)"], timeout=0.5),
-           "a child that hangs is killed at its timeout and raises, instead "
-           "of holding the run for two minutes",
-           kind=subprocess.TimeoutExpired)
-    check(time.time() - started < 20, "and it was killed, not waited for")
-    check(winenv._run([sys.executable, "-c",
-                       "import sys; sys.stderr.write('oops\\n'); sys.exit(3)"])
-          == (3, "", "oops")
-          and winenv._run([sys.executable, "-c", "import sys; sys.exit(4)"])[2]
-          == "exit code 4",
-          "a child's exit code, output and first error line are returned, "
-          "and a silent failure still gets a reason")
+    # A child is spawned by resolved interpreter, never by sys.executable:
+    # inside ArcGIS Pro that is ArcGISPro.exe, and starting it opens a second
+    # copy of the application instead of running the snippet.
+    py = winenv.python_exe()
+    if py is None:
+        skip("a child that hangs is killed at its timeout and raises",
+             "no Python interpreter to spawn here; sys.executable is %r"
+             % (sys.executable,))
+        skip("and it was killed, not waited for", "nothing was spawned")
+        skip("a child's exit code, output and first error line are returned",
+             "nothing was spawned")
+    else:
+        started = time.time()
+        raises(lambda: winenv._run([py, "-c", "import time; time.sleep(30)"],
+                                   timeout=0.5),
+               "a child that hangs is killed at its timeout and raises, "
+               "instead of holding the run for two minutes",
+               kind=subprocess.TimeoutExpired)
+        check(time.time() - started < 20, "and it was killed, not waited for")
+        check(winenv._run([py, "-c",
+                           "import sys; sys.stderr.write('oops\\n'); "
+                           "sys.exit(3)"], timeout=20) == (3, "", "oops")
+              and winenv._run([py, "-c", "import sys; sys.exit(4)"],
+                              timeout=20)[2] == "exit code 4",
+              "a child's exit code, output and first error line are returned, "
+              "and a silent failure still gets a reason")
+    check(winenv.python_exe() is None
+          or os.path.basename(winenv.python_exe()).lower().startswith("python"),
+          "the interpreter is resolved by name and is never the host "
+          "application: spawning ArcGISPro.exe with -c opens a second copy of "
+          "Pro and hangs until the timeout  <-- pinned defect")
 
     lines, code = summarize(3, ["it broke"])
     check(code == 1 and lines == ["4 assertions, 1 failed",
@@ -7639,6 +7707,9 @@ def self_test():
           "a failing self-test says how many failed, names each, and exits 1")
     check(summarize(2, []) == (["2 assertions, 0 failed"], 0),
           "and a clean one exits 0")
+    check(summarize(2, [], 3) == (["2 assertions, 0 failed, 3 skipped"], 0),
+          "an assertion a host could not run is named in the footer and is "
+          "counted in neither number: a skip is not a pass")
     imported = runpy.run_path(os.path.abspath(__file__),
                               run_name="properf_imported")
     check(callable(imported["main"]),
@@ -7762,7 +7833,7 @@ def self_test():
           "and every one of them printed a line the operator can see")
 
     print("-" * 70)
-    lines, code = summarize(passed[0], failed)
+    lines, code = summarize(passed[0], failed, not_run[0])
     for line in lines:
         print(line)
     return code
@@ -7921,7 +7992,7 @@ def main(argv=None):
 
 # ============================================================================
 # 2/3  HTML report renderer
-# source: html_report.py  (sha256:6244912c1e5c)
+# source: html_report.py  (sha256:55de8bc2d7fc)
 # ----------------------------------------------------------------------------
 # r"""Render an ArcGIS Pro Performance Analyser report as one self-contained
 # HTML page.
@@ -7991,13 +8062,16 @@ EXIT_MEANING = {
 # The symptom key the analyser writes into its impact lines. Reproduced here so
 # the flags on the page agree with the letters in the text.
 SYMPTOM_FALLBACK = (
-    ("S1", "the project opens slowly, minutes rather than seconds"),
-    ("S2", "the session hangs for minutes mid-edit, sometimes to a force-close"),
-    ("S3", "saved edits are silently gone after such a hang (most serious)"),
-    ("S4", "a field-calculated value updates the table but the map does not "
-           "redraw"),
-    ("S5", "copy or paste of a feature does nothing for many seconds, and "
-           "retries duplicate it"),
+    ("S1", "le projet met des minutes a s'ouvrir au lieu de quelques "
+           "secondes"),
+    ("S2", "la session se fige plusieurs minutes en pleine modification, "
+           "parfois jusqu'a une fermeture forcee"),
+    ("S3", "des modifications enregistrees ont disparu sans message apres "
+           "un tel figeage (le plus grave)"),
+    ("S4", "une valeur recalculee met a jour la table mais la carte ne se "
+           "redessine pas"),
+    ("S5", "un copier ou coller d'entite ne fait rien pendant plusieurs "
+           "secondes, et les tentatives suivantes le dupliquent"),
 )
 
 # What each finding costs the score. A finding that bears on lost edits costs
@@ -8796,7 +8870,7 @@ def write_html(document, path, verbose=False, exit_code=None, meta=None):
 
 # ============================================================================
 # 3/3  ArcGIS Pro toolbox glue
-# source: toolbox_glue.py  (sha256:28e70755eaec)
+# source: toolbox_glue.py  (sha256:238f270b063c)
 # ----------------------------------------------------------------------------
 # r"""The ArcGIS Pro glue: two geoprocessing tools over the diagnostic engine
 # and the HTML renderer.
@@ -8893,9 +8967,12 @@ class Toolbox(object):
         self.label = "ArcGIS Pro Performance Analyser"
         self.alias = "properf"
         self.description = (
-            "Diagnose why ArcGIS Pro is slow on this workstation, and never "
-            "report a finding the machine did not produce. Read-only unless "
-            "you enable the fixes.")
+            "Deux outils.  1) Diagnostiquer la lenteur d'ArcGIS Pro : "
+            "celui qu'on lance - il lit ce poste et rend un rapport HTML. "
+            "2) Verifier l'analyseur : un controle du fichier lui-meme, a "
+            "lancer une fois sur une nouvelle machine avant de croire un "
+            "rapport. Lecture seule tant que les correctifs ne sont pas "
+            "coches.")
         self.tools = [Diagnose, VerifyAnalyser]
         self.canRunInBackground = False
 
@@ -8904,19 +8981,36 @@ class Diagnose(object):
     """The workstation diagnostic, with the result as HTML."""
 
     def __init__(self):
-        self.label = "Diagnose ArcGIS Pro slowness"
+        self.label = "Diagnostiquer la lenteur d'ArcGIS Pro"
         self.description = (
-            "Read this workstation's registry, storage, OneDrive redirection, "
-            "network and cache state, and report which of it explains a slow "
-            "ArcGIS Pro session and which of it could lose an edit. Read-only "
-            "unless the fixes are enabled. Writes an HTML, a JSON and a text "
-            "report.")
+            "L'OUTIL A LANCER. Lit ce poste - registre, stockage, "
+            "redirection OneDrive, reseau, cache - et rend un rapport HTML "
+            "qui dit, controle par controle, ce qui a ete mesure, ce que "
+            "cela coute a ArcGIS Pro et comment le corriger. Trente-six "
+            "controles, dont treize portent sur des modifications qui "
+            "peuvent se perdre. Lecture seule, sauf si vous cochez "
+            "explicitement les correctifs. Ecrit un HTML, un JSON et un "
+            "texte. Les parametres par defaut suffisent pour un premier "
+            "passage : ne renseignez rien.")
         self.canRunInBackground = False
-        self.category = "Diagnose"
+        self.category = "Diagnostic"
 
     def getParameterInfo(self):
+        def hinted(param, tooltip, long_help):
+            """Attach the two help fields ArcGIS Pro shows for a parameter.
+
+            `helpMessage` is the tooltip behind the little question mark;
+            `parameterHelp` is the paragraph in the tool's help panel. Both are
+            filled in here rather than left to the display name, because the
+            display name has to stay short enough to fit the pane, and a short
+            label cannot carry an example.
+            """
+            param.helpMessage = tooltip
+            param.parameterHelp = long_help
+            return param
+
         out = arcpy.Parameter(
-            displayName="Output folder",
+            displayName="Dossier de sortie",
             name="output_folder",
             datatype="DEFolder",
             parameterType="Optional",
@@ -8924,81 +9018,182 @@ class Diagnose(object):
         out.value = os.path.join(
             arcpy.env.scratchFolder or os.environ.get("TEMP") or ".",
             "ArcGISPro_PerformanceAnalyser")
+        hinted(out,
+               "Ou ecrire les rapports. Laisse vide pour garder le defaut.",
+               "<p>Dossier ou l'outil ecrit ses trois fichiers : le rapport "
+               "<b>HTML</b> (celui qu'on lit), le <b>JSON</b> (pour comparer "
+               "deux passages) et le <b>TXT</b> (pour coller dans un ticket).</p>"
+               "<p><b>Defaut</b> : <code>&lt;scratch&gt;\\ArcGISPro_Performance"
+               "Analyser</code>. Le dossier est cree s'il n'existe pas.</p>"
+               "<p><b>Exemple</b> : <code>C:\\Temp\\diag_analyser</code>. "
+               "Choisissez un dossier <b>local</b>, pas un partage reseau : "
+               "l'ecriture doit rester rapide et ne dependre d'aucun "
+               "serveur.</p>"
+               "<p>Rien d'existant n'est ecrase : deux passages dans la meme "
+               "seconde produisent deux jeux de fichiers.</p>")
 
         sde = arcpy.Parameter(
-            displayName="Enterprise geodatabase host to probe",
+            displayName="Hote de la geodatabase d'entreprise a sonder",
             name="sde_server",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        sde.category = "Network probes (opt-in)"
+        sde.category = "Sondes reseau (sur demande)"
+        hinted(sde,
+               "Nom du serveur SQL/Oracle de vos donnees. Vide = aucun "
+               "hote contacte.",
+               "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b> Vide, "
+               "aucun paquet ne quitte la machine et le controle DL-10 repond "
+               "<code>Info</code> au lieu d'inventer une mesure.</p>"
+               "<p>Renseigne, l'outil ouvre <b>une seule</b> connexion TCP, "
+               "mesure le temps de reponse, puis referme. Il ne s'authentifie "
+               "jamais et n'envoie aucun identifiant.</p>"
+               "<p><b>Exemple</b> : <code>gisdb01</code> ou "
+               "<code>gisdb01.monorg.ch</code>. C'est le serveur nomme dans "
+               "vos fichiers de connexion <code>.sde</code>.</p>"
+               "<p><b>A quoi ca sert</b> : une latence elevee vers ce serveur "
+               "explique a elle seule un Pro lent a l'ouverture des cartes.</p>")
 
         port = arcpy.Parameter(
-            displayName="Geodatabase port",
+            displayName="Port de la geodatabase",
             name="sde_port",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         port.value = 1433
-        port.category = "Network probes (opt-in)"
+        port.category = "Sondes reseau (sur demande)"
+        hinted(port,
+               "Port du serveur. 1433 = SQL Server (le plus courant).",
+               "<p><b>Defaut</b> : <code>1433</code> (SQL Server).</p>"
+               "<p><b>Valeurs courantes</b> : <code>1433</code> SQL Server, "
+               "<code>1521</code> Oracle, <code>5432</code> PostgreSQL.</p>"
+               "<p>Si vous ne connaissez pas le moteur, laissez 1433 : un port "
+               "ferme repond « ferme », ce qui est deja une information, et "
+               "l'outil ne devine jamais.</p>")
 
         portal = arcpy.Parameter(
-            displayName="Portal host to probe (port 443)",
+            displayName="Hote du portail a sonder (port 443)",
             name="portal",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        portal.category = "Network probes (opt-in)"
+        portal.category = "Sondes reseau (sur demande)"
+        hinted(portal,
+               "Adresse de votre portail ou d'ArcGIS Online. Vide = aucun "
+               "hote contacte.",
+               "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b></p>"
+               "<p><b>Exemple</b> : <code>gis.monorg.ch</code> pour un Portal "
+               "for ArcGIS interne, ou <code>www.arcgis.com</code> pour "
+               "ArcGIS Online.</p>"
+               "<p>Une seule connexion TCP sur le port 443, mesuree puis "
+               "refermee. Aucun identifiant n'est envoye.</p>")
 
         timeout = arcpy.Parameter(
-            displayName="Probe timeout (milliseconds)",
+            displayName="Delai des sondes (millisecondes)",
             name="timeout",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         timeout.value = 4000
-        timeout.category = "Network probes (opt-in)"
+        timeout.category = "Sondes reseau (sur demande)"
+        hinted(timeout,
+               "Duree maximale de chaque sonde. 4000 ms convient presque "
+               "toujours.",
+               "<p><b>Defaut</b> : <code>4000</code> ms (4 secondes).</p>"
+               "<p>C'est une <b>borne</b>, pas une attente : une sonde qui "
+               "repond en 40 ms rend la main en 40 ms. Le delai ne sert que "
+               "pour un serveur injoignable.</p>"
+               "<p>Augmentez a <code>10000</code> sur un reseau tres lent, "
+               "descendez a <code>1500</code> pour un passage plus rapide.</p>")
 
         verbose = arcpy.Parameter(
-            displayName="Verbose (expected text and evidence lines)",
+            displayName="Detaille (valeur attendue et lignes de preuve)",
             name="verbose",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         verbose.value = False
+        hinted(verbose,
+               "Affiche ce que l'outil attendait et ce qu'il a reellement lu.",
+               "<p><b>Defaut</b> : decoche.</p>"
+               "<p>Cochez-le quand vous devez <b>prouver</b> un resultat a "
+               "quelqu'un : chaque controle montre alors la valeur attendue et "
+               "la ligne brute lue sur la machine, en plus du verdict.</p>"
+               "<p>Decoche, le rapport reste complet ; seules ces lignes de "
+               "preuve sont repliees.</p>")
 
         text = arcpy.Parameter(
-            displayName="Also write the plain-text report",
+            displayName="Ecrire aussi le rapport texte",
             name="write_text",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         text.value = True
+        hinted(text,
+               "Ajoute un .txt, pratique a coller dans un ticket.",
+               "<p><b>Defaut</b> : coche.</p>"
+               "<p>Le <code>.txt</code> reprend le rapport HTML en texte brut. "
+               "C'est le format a coller dans un appel au support ou dans un "
+               "courriel, parce qu'il ne depend d'aucun navigateur.</p>")
 
         browser = arcpy.Parameter(
-            displayName="Open the HTML report in the default browser",
+            displayName="Ouvrir le rapport HTML dans le navigateur",
             name="open_browser",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         browser.value = True
+        hinted(browser,
+               "Ouvre le rapport a la fin. Decochez pour un lot ou un modele.",
+               "<p><b>Defaut</b> : coche.</p>"
+               "<p>Le rapport s'ouvre dans le navigateur par defaut. "
+               "Decochez-le si l'outil tourne dans un modele ModelBuilder, ou "
+               "si le navigateur est bloque par strategie de groupe : le fichier est ecrit dans "
+               "tous les cas et son chemin apparait dans les messages.</p>")
 
         apply_fixes = arcpy.Parameter(
-            displayName="Apply the gated fixes (renames the cache aside, pins "
-                        "the GPU preference)",
+            displayName="Appliquer les correctifs (renomme le cache, epingle "
+                        "le choix de carte graphique)",
             name="apply_fixes",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         apply_fixes.value = False
-        apply_fixes.category = "Changes machine state"
+        apply_fixes.category = "Modifie la machine"
+        hinted(apply_fixes,
+               "SEUL parametre qui modifie la machine. Laisse decoche, "
+               "l'outil est en lecture seule.",
+               "<p><b>Defaut</b> : <b>decoche</b>. L'outil ne fait alors que "
+               "lire.</p>"
+               "<p>Coche, deux correctifs seulement, et chacun seulement si son "
+               "propre controle l'a justifie :</p>"
+               "<ul>"
+               "<li><b>AP-01</b> renomme le dossier de cache ESRI en lui "
+               "ajoutant un suffixe <code>.properf-&lt;date&gt;</code>. "
+               "<b>Rien n'est supprime</b> : l'ancien dossier reste sur le "
+               "disque et Pro en reconstruit un neuf. Refuse depuis Pro, parce "
+               "que Pro tient ce dossier.</li>"
+               "<li><b>AP-02</b> ecrit la preference « carte graphique "
+               "hautes performances » pour <code>ArcGISPro.exe</code>, dans "
+               "<code>HKCU</code> uniquement.</li>"
+               "</ul>"
+               "<p><b>Chaque correctif applique affiche sa propre commande "
+               "d'annulation</b> dans les messages et dans le rapport. Copiez-"
+               "la avant de fermer la fenetre.</p>")
 
         html_out = arcpy.Parameter(
-            displayName="HTML report",
+            displayName="Rapport HTML",
             name="html_report",
             datatype="GPString",
             parameterType="Derived",
             direction="Output")
+        hinted(html_out,
+               "Sortie : chemin du rapport HTML. Ne se remplit pas a la main.",
+               "<p><b>Sortie derivee</b> : l'outil la remplit lui-meme avec le "
+               "chemin du rapport ecrit.</p>"
+               "<p>Elle existe pour que l'outil puisse etre <b>enchaine</b> "
+               "dans un modele ModelBuilder : un outil suivant peut reprendre "
+               "ce chemin.</p>")
 
         return [out, sde, port, portal, timeout, verbose, text, browser,
                 apply_fixes, html_out]
@@ -9151,13 +9346,17 @@ class VerifyAnalyser(object):
     """
 
     def __init__(self):
-        self.label = "Verify the analyser (offline self-test)"
+        self.label = "Verifier l'analyseur (autotest hors ligne)"
         self.description = (
-            "Run the analyser's offline assertions over its own decision "
-            "functions, on stand-in workstations, and report how many passed. "
-            "Reads no registry, writes nothing, contacts no host.")
+            "PAS un diagnostic de votre poste. Cet outil verifie le "
+            "FICHIER : il rejoue ses propres assertions sur des postes de "
+            "travail de substitution et dit combien passent. A lancer une "
+            "fois sur une nouvelle machine, avant de croire un rapport - "
+            "cela prouve que la copie qu'on vous a donnee n'est pas "
+            "abimee. Ne lit aucun registre, n'ecrit rien, ne contacte "
+            "aucun hote. Aucun parametre a remplir.")
         self.canRunInBackground = False
-        self.category = "Diagnose"
+        self.category = "Diagnostic"
 
     def getParameterInfo(self):
         result = arcpy.Parameter(
@@ -9193,20 +9392,24 @@ class VerifyAnalyser(object):
         captured = buffer.getvalue()
         for line in _tail(captured, 25):
             messages.addMessage("  %s" % line)
-        total = len([l for l in captured.splitlines()
-                     if l.startswith(("PASS  ", "FAIL  "))])
-        failed = [l for l in captured.splitlines() if l.startswith("FAIL  ")]
+        lines = captured.splitlines()
+        total = len([l for l in lines if l.startswith(("PASS  ", "FAIL  "))])
+        failed = [l for l in lines if l.startswith("FAIL  ")]
+        not_run = [l for l in lines if l.startswith("SKIP  ")]
+        tail = "" if not not_run else ", %d not run" % len(not_run)
+        for line in not_run:
+            messages.addWarningMessage("  %s" % line)
         if code == 0:
             messages.addMessage(
-                "%d assertions, 0 failed, in %.1f s."
-                % (total, time.time() - started))
-            parameters[0].value = "%d assertions, 0 failed" % total
+                "%d assertions, 0 failed%s, in %.1f s."
+                % (total, tail, time.time() - started))
+            parameters[0].value = "%d assertions, 0 failed%s" % (total, tail)
         else:
             for line in failed:
                 messages.addErrorMessage("  %s" % line)
             messages.addErrorMessage(
-                "%d of %d assertions failed." % (len(failed), total))
-            parameters[0].value = "%d of %d assertions failed" % (
-                len(failed), total)
+                "%d of %d assertions failed%s." % (len(failed), total, tail))
+            parameters[0].value = "%d of %d assertions failed%s" % (
+                len(failed), total, tail)
             raise arcpy.ExecuteError()
         return
