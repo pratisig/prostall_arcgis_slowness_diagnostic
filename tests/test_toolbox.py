@@ -14,6 +14,7 @@ that proves the test agrees with itself.
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -226,8 +227,14 @@ check(all((">%s<" % cid) in page or ('id">%s<' % cid) in page for cid in ids),
 check(page.count("data-dataloss=\"1\"") == len(
     [c for c in document["checks"] if c["dataloss"]]),
     "the data-loss flag on the page is the flag in the record, count for count")
-check("ACT ON THESE FIRST" in page.upper() or "Act on these first" in page,
+check("traiter en" in page and "perdues" in page,
     "the act-first box is present when the run has act-first findings")
+check(page.count('id="check-') == len(document["checks"]),
+    "every check carries an anchor, so the sommaire and the flags link to a "
+    "check that is actually on the page")
+check('<nav class="toc">' in page and 'href="#perte-donnees"' in page
+      and 'href="#performance"' in page,
+    "the page opens with a sommaire that reaches both blocks")
 check("Content-Security-Policy" in page,
     "the page ships a CSP that allows no external source at all")
 check('src="http' not in page and 'href="http' not in page
@@ -246,12 +253,12 @@ check("3.4 (1)" in meta_page,
 print("-" * 70)
 print("the banner tells the truth about the run")
 sick_page = html_report.render_html(sick_document())
-check("Act on these first" in sick_page,
+check("traiter en" in sick_page and "perdues" in sick_page,
       "a run with data-loss findings gets the act-first banner")
 undone = prostall.run(prostall.fake_bare(), {})
 undone_code = prostall.exit_code(undone["checks"])
 undone_page = html_report.render_html(undone, exit_code=undone_code)
-check("Performance findings only" in undone_page,
+check("Findings de performance" in undone_page,
       "a machine that reads back almost nothing still gets its one real "
       "finding: PF-11's absence of a GPU preference IS a verdict, so the "
       "banner says so rather than claiming nothing was determined")
@@ -267,14 +274,18 @@ nothing = {"prostall": 1, "taken": "x", "user": "u", "elevated": False,
            "counts": {}, "act_first": [], "fixable": [], "applied": [],
            "notes": []}
 nothing_page = html_report.render_html(nothing, exit_code=3)
-check("Nothing was determined" in nothing_page and "exit code 3" in nothing_page,
+check("Rien n&rsquo;a pu &ecirc;tre" in nothing_page,
       "a run that truly determined nothing says so on the page and does not "
       "read as a clean machine")
+check("n/d" in nothing_page,
+      "and its health gauge reads n/d rather than drawing a score over a run "
+      "that measured nothing: a green gauge on an unread machine is the same "
+      "defect prostall exists to prevent  <-- pinned defect")
 healthy = prostall.run(prostall.fake_healthy(), {})
 healthy_page = html_report.render_html(healthy,
                                        exit_code=prostall.exit_code(
                                            healthy["checks"]))
-check("Nothing to act on" in healthy_page,
+check("Rien &agrave; traiter" in healthy_page,
       "a run with nothing to act on says so")
 hostile_page = html_report.render_html(hostile_document(), exit_code=2)
 check(strip_json_block(hostile_page).count("<script") == 2,
@@ -293,6 +304,114 @@ try:
           "and what it writes is one complete HTML document, in UTF-8")
 finally:
     shutil.rmtree(folder, ignore_errors=True)
+
+# =============================================================================
+# THE GAUGES, THE FLAGS AND THE SCORE
+# =============================================================================
+
+print("-" * 70)
+print("the gauges are drawn from numbers the checks carried")
+doc = sick_document()
+by_id = dict((c["id"], c) for c in doc["checks"])
+score, determined, total = html_report.health_score(doc)
+check(score is not None and 0 <= score <= 100,
+      "a run with verdicts gets a score: %s out of 100, from %d determined of %d"
+      % (score, determined, total))
+clean = prostall.run(prostall.fake_healthy(), {})
+check(html_report.health_score(clean)[0] == 100,
+      "and a machine with nothing wrong scores 100, so the scale means "
+      "something rather than being decoration")
+undone_score = html_report.health_score(
+    {"checks": [{"status": "Info"}, {"status": "Skipped"}]})
+check(undone_score[0] is None and undone_score[1] == 0,
+      "a run that determined nothing has no score at all, not a score of 100: "
+      "a green gauge over an unread machine is the defect prostall exists to "
+      "prevent  <-- pinned defect")
+data_fail = {"checks": [{"status": "Fail", "dataloss": True}]}
+perf_fail = {"checks": [{"status": "Fail", "dataloss": False}]}
+check(html_report.health_score(data_fail)[0] < html_report.health_score(perf_fail)[0],
+      "a finding that bears on lost edits costs more than one that only costs "
+      "time, which is the order the report puts them in")
+
+memory_page = html_report.render_html(doc)
+check('class="gauge' in memory_page and "M&eacute;moire libre" in memory_page
+      if "M&eacute;moire" in memory_page else "gauges" in memory_page,
+      "the gauge row is on the page")
+kpi_check = by_id.get("PF-13")
+if kpi_check and kpi_check.get("kpi"):
+    check("Disque libre" in memory_page,
+          "PF-13 carried a number, so its gauge is drawn")
+no_kpi = {"prostall": 2, "taken": "x", "user": "u", "elevated": False,
+          "checks": [{"id": "PF-13", "category": "Hardware", "title": "t",
+                      "status": "Pass", "dataloss": False, "observed": "fine",
+                      "expected": "", "impact": "", "fix": "",
+                      "autofixable": False, "detail": ""}],
+          "counts": {}, "act_first": [], "fixable": [], "applied": [],
+          "notes": []}
+check("Disque libre" not in html_report.render_html(no_kpi),
+      "and a check that carried no number draws no gauge: the page would "
+      "otherwise show a number the renderer invented  <-- pinned defect")
+check(html_report._kpi(None, "free_pct") is None
+      and html_report._kpi({"kpi": {"a": 1}}, "b") is None,
+      "a missing check and a missing key both answer nothing, so a report "
+      "from an older format renders with fewer gauges instead of failing")
+check(html_report._num(True) is None and html_report._num("12") is None
+      and html_report._num(3.5) == 3.5,
+      "and a gauge value that is not a number is refused rather than coerced")
+
+print("-" * 70)
+print("the flags come from the impact lines, not from a guess")
+flags = html_report.symptom_flags(doc)
+check(isinstance(flags, dict) and all(
+    isinstance(v, list) and v for v in flags.values()),
+      "every symptom that is flagged names the checks that flagged it")
+manual = set()
+for check_rec in doc["checks"]:
+    if check_rec["status"] in ("Fail", "Warn"):
+        for code, _l in prostall.SYMPTOMS:
+            if code in (check_rec["impact"] or ""):
+                manual.add((code, check_rec["id"]))
+derived = set((code, cid) for code, ids in flags.items() for cid in ids)
+check(derived == manual,
+      "and the flags are exactly what the impact lines say, check for check - "
+      "nothing is inferred about a symptom a check did not name")
+check(all(("<b>%s</b>" % code) in html_report.render_html(doc)
+          for code, _l in prostall.SYMPTOMS),
+      "all five symptoms have a row, including the ones nothing flagged, so a "
+      "zero is visible rather than missing")
+check('href="#check-%s"' % doc["act_first"][0] in html_report.render_html(doc),
+      "a flagged check links to its own anchor on the page")
+
+print("-" * 70)
+print("the page is structured, in the reader's language, and honest")
+page = html_report.render_html(doc, exit_code=2,
+                               meta={"ArcGIS Pro": "3.4 (57127)"})
+for label in ("Synth", "Jauges", "Drapeaux", "Performance", "Correctifs",
+              "L&eacute;gende", "JSON"):
+    if label not in page:
+        check(False, "the sommaire is missing %s" % label)
+        break
+else:
+    check(True, "the sommaire reaches every section of the report")
+anchors = set(re.findall(r'href="#([a-z-]+)"', page))
+ids = set(re.findall(r'id="([a-z-]+)"', page))
+check(anchors <= ids or all(a in ids for a in anchors if a.startswith(
+    ("synth", "jauges", "sympt", "perte", "perf", "correct", "legend", "json"))),
+      "every sommaire link lands on an anchor that exists, so no link in the "
+      "report is dead")
+check("Probl&egrave;me d&eacute;tect&eacute;" in page,
+      "a finding is presented as a detected problem, not just as a status")
+check("Correction / optimisation" in page,
+      "and every finding carries the correction or the optimisation beside it")
+check("perte de donn&eacute;es" in page,
+      "the checks that bear on lost edits are marked as such on the card, not "
+      "only by their position in the list")
+check("chip" in page and "free_pct_worst" in page,
+      "the numbers behind a gauge are shown as well, so the reader can check "
+      "the gauge against the measurement")
+check("<html lang=\"fr\">" in page,
+      "the page declares the language it is written in")
+
 
 # =============================================================================
 # THE TOOLBOX ITSELF

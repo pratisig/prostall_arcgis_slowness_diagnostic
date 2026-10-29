@@ -100,7 +100,9 @@ SYMPTOMS = (
 
 # Report format version. Bumped when the JSON shape changes, so a diff against
 # an older report from a known-good workstation fails loudly instead of quietly.
-REPORT_VERSION = 1
+# 2 adds the kpi mapping on the checks that measure a number, which is what the
+# HTML report draws its gauges from.
+REPORT_VERSION = 2
 
 # Thresholds, named here rather than buried at the call site.
 SDE_LATENCY_WARN_MS = 250       # a LAN SQL host answers far inside this
@@ -123,6 +125,33 @@ INDEX_MANY_CONNECTIONS = 10
 EVENT_WINDOW_DAYS = 14
 EVENT_MAX = 200
 
+# Project complexity. These are this tool's allowances. A project that opens
+# slowly because it is enormous is not a workstation fault, but it is an answer,
+# and it is the answer that stops the rest of the report being read as the
+# whole story.
+APRX_BIG_BYTES = 20 * 1024 ** 2
+LAYERS_MANY = 150
+LAYERS_WARN = 60
+GROUP_DEEP_WARN = 4
+HTTP_LAYERS_WARN = 3
+JOINS_WARN = 3
+
+# A rotational disk holding the caches and the scratch workspace is the single
+# most common hardware cause of a slow session, and the only one that no
+# setting fixes. Compared in upper case, so "Unspecified" from the cmdlet and
+# "unspecified" from a localised build are the same answer.
+DISK_MEDIA_WARN = ("HDD", "UNSPECIFIED")
+
+# A link below this cannot carry an enterprise editing session and a basemap
+# at the same time. 1 GbE is the floor for a wired GIS workstation; 100 Mbit
+# still ships on managed images and on docking stations.
+LINK_SPEED_MIN_MBPS = 1000
+
+# A pagefile smaller than this cannot absorb a 32-bit-equivalent draw spike
+# on a machine that is already near its memory ceiling, and a pagefile on a
+# network volume is a stall nobody will find in the Pro logs.
+PAGEFILE_MIN_MB = 4096
+
 # One directory listing on the project share. These are this tool's
 # allowances, not a published figure: Pro lists folders many times while it
 # opens a project, so a single listing in the hundreds of milliseconds is
@@ -138,6 +167,17 @@ APRX_MAX_PROJECTS = 3
 APRX_MAX_ENTRIES = 300
 APRX_MAX_ENTRY_BYTES = 4 * 1024 ** 2
 APRX_MAX_BYTES = 32 * 1024 ** 2
+
+# A Pro user.config is a few kilobytes of XML. This ceiling is not about Pro:
+# it is about a file this tool did not write, in a folder OneDrive may sync
+# from somewhere else. Without it one read pulls the whole file into memory.
+MAX_TEXT_BYTES = 2 * 1024 ** 2
+
+# An .aprx is a zip, and the walk of its parsed documents is iterative rather
+# than recursive, because a hostile or corrupt project nests arbitrarily deep
+# and the recursive version ended the check with a RecursionError.
+APRX_MAX_DEPTH = 200
+APRX_MAX_NODES = 200000
 
 # Get-MpPreference does not fail for a caller who may not see the exclusion
 # lists. It puts this text where each list would be. Compared as a path, it
@@ -194,7 +234,7 @@ def _join(value):
 
 def make_check(cid, category, title, status, observed, expected="", impact="",
                fix="", autofixable=False, dataloss=False, detail="",
-               measured=True):
+               measured=True, kpi=None):
     """Build one check record, or refuse.
 
     Four refusals, each one a defect somebody shipped:
@@ -206,6 +246,9 @@ def make_check(cid, category, title, status, observed, expected="", impact="",
        body that lies by accident; this catches one that lies on purpose.
     4. AutoFixable with no fix text. The summary offers those to the operator
        by id, so a fixable flag with nothing behind it is an offer of nothing.
+    5. A KPI that is not a dict of numbers. The HTML report draws its gauges
+       from these, and a gauge drawn off a string parsed back out of a
+       sentence is a number the report invented on the way to the page.
     """
     if status not in STATUSES:
         raise ValueError("status %r is not one of %s"
@@ -220,7 +263,14 @@ def make_check(cid, category, title, status, observed, expected="", impact="",
             "nothing: %r" % (cid, status, observed[:120]))
     if autofixable and not fix.strip():
         raise ValueError("%s is marked auto-fixable with no fix text" % cid)
-    return {
+    if kpi is not None:
+        if not isinstance(kpi, dict):
+            raise ValueError("%s carries a KPI that is not a mapping" % cid)
+        for key, value in kpi.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("%s carries a KPI %r that is not a number"
+                                 % (cid, key))
+    record = {
         "id": cid,
         "category": category,
         "title": title,
@@ -233,6 +283,9 @@ def make_check(cid, category, title, status, observed, expected="", impact="",
         "autofixable": bool(autofixable),
         "detail": detail,
     }
+    if kpi:
+        record["kpi"] = dict(kpi)
+    return record
 
 
 def add_check(checks, **kwargs):
@@ -437,17 +490,25 @@ def parse_user_config(text):
     it finds and never writes it back. First value wins: the names are unique
     within a section, and a later duplicate is a merge artefact.
 
-    ElementTree's default parser does not resolve external entities and does
-    not expand custom ones - it raises on an undefined entity instead - so a
-    user.config cannot make this read a file off a share. Malformed XML is a
-    missing answer, not a traceback: the check that called this then says the
-    settings could not be parsed and stays undetermined.
+    ElementTree's default parser does not fetch external entities, so a
+    user.config cannot make this read a file off a share. It does expand
+    internal ones, which is a different problem: fifty lines of nested
+    <!ENTITY> declarations turn a few hundred bytes into hundreds of
+    megabytes inside expat, and this is a file a sync client may have put
+    here. So a document type declaration is refused outright. A real Pro
+    user.config has none, and a reader that wanted one would be a reader
+    that had already been talked into expanding it.
+
+    Malformed XML is a missing answer, not a traceback: the check that called
+    this then says the settings could not be parsed and stays undetermined.
     """
     from xml.etree import ElementTree   # imported here so a run with no
                                         # user.config never pays for it
 
     out = {}
     if not text or not text.strip():
+        return out
+    if re.search(r"<!\s*DOCTYPE", text, re.IGNORECASE):
         return out
     try:
         root = ElementTree.fromstring(text)
@@ -534,7 +595,7 @@ def decide_session(me, other_profiles, elevated):
         fix="None.")
 
 
-def decide_backup(config_path, settings, home_class):
+def decide_backup(config_path, settings, home_class, error=None):
     """DL-03. The project backup interval, and what it does not protect.
 
     Named for what it is not. Editors read "Create backups of project" as an
@@ -542,6 +603,10 @@ def decide_backup(config_path, settings, home_class):
     a stranded version state is stranded regardless of this setting. On a
     network or synced home folder a short interval is also a recurring
     multi-second stall, which is the pause the editor calls "the refresh".
+
+    error is a failed read of user.config, as distinct from an absent one. A
+    file nobody could read is not a file whose settings are all `<absent>`, and
+    printing that list would carry a verdict about settings nobody saw.
     """
     if not config_path:
         return dict(
@@ -551,6 +616,19 @@ def decide_backup(config_path, settings, home_class):
             observed="No user.config was located for this profile, so the "
                      "backup settings could not be read.",
             expected="A readable user.config for the installed Pro release.",
+            impact="S2 and S3 undetermined.",
+            fix="Read it in Pro: Project > Options > General > Create backups "
+                "of project.")
+    if error:
+        return dict(
+            cid="DL-03", category="ArcGISPro", dataloss=True, status="Info",
+            measured=False,
+            title="Pro project backup interval",
+            observed=["%s could not be read: %s. Its settings are unknown, "
+                      "which is not the same as all of them being unset."
+                      % (config_path, error)],
+            expected="A user.config small enough and well-formed enough to "
+                     "read.",
             impact="S2 and S3 undetermined.",
             fix="Read it in Pro: Project > Options > General > Create backups "
                 "of project.")
@@ -855,7 +933,8 @@ def decide_tcp(cid, category, title, host, port, probe, warn_ms, impact, fix,
         title=title, observed=observed,
         expected="A TCP connect well inside %d ms. Connect only: no "
                  "credential is used." % warn_ms,
-        impact=impact, fix=fix)
+        impact=impact, fix=fix,
+        kpi={"elapsed_ms": elapsed, "warn_ms": warn_ms})
 
 
 def decide_sde_files(paths, index_copies):
@@ -1040,12 +1119,16 @@ def decide_pro_version(version, real, build, install_dir, exe_version):
             "patch for this build before changing any client setting.")
 
 
-def decide_rendering(config_path, settings):
+def decide_rendering(config_path, settings, error=None):
     """PF-05. The display settings, read only.
 
     None of these cause edit loss. They are the draw-performance levers, and
     they are here so the report can be diffed against a workstation that is
     known to be fast.
+
+    error is a failed read of user.config: the settings are unknown, not all
+    off, and a rendering verdict off a file nobody opened would name a lever
+    this run never looked at.
     """
     if not config_path:
         return dict(
@@ -1053,6 +1136,15 @@ def decide_rendering(config_path, settings):
             title="Pro rendering and display settings",
             observed="No user.config was located, so the display settings "
                      "could not be read.",
+            expected="A readable user.config.", impact="S4 undetermined.",
+            fix="Read them in Pro: Project > Options > Display.")
+    if error:
+        return dict(
+            cid="PF-05", category="Display", status="Info", measured=False,
+            title="Pro rendering and display settings",
+            observed="%s could not be read: %s. The display settings are "
+                     "unknown, which is not the same as all of them being off."
+                     % (config_path, error),
             expected="A readable user.config.", impact="S4 undetermined.",
             fix="Read them in Pro: Project > Options > Display.")
     names = ("RenderingEngine", "RenderingQuality", "EnableRenderingAntialiasing",
@@ -1111,24 +1203,35 @@ def decide_caches(path, exists, total_bytes, files, oldest, oldest_age_days,
             "it, or tick Project > Options > Display > clear the cache when "
             "the application closes. --apply renames the folder aside and "
             "prints the undo; it never deletes it.",
-        autofixable=True)
+        autofixable=True,
+        kpi={"bytes": total_bytes, "files": files,
+             "stale_pct": ratio * 100.0, "stale_files": stale_files})
 
 
 def decide_index(res_bytes, res_files, connection_copies, status_stamp,
-                 settings):
+                 settings, error=None):
     """PF-08. The catalog search index.
 
     Indexing a network connection walks the share at startup and again on every
     incremental pass, which is one of the two ways a five-minute open happens
     on a machine that is otherwise healthy.
+
+    error is a failed read of user.config. The folder counts below it were
+    measured, so a verdict off those stands; the settings lines say they were
+    not read rather than printing `<absent>` for a file nobody opened.
     """
     lines = ["ResourceIndex: %s in %d files" % (format_bytes(res_bytes),
                                                 res_files),
              "Cached connection files indexed: %d" % connection_copies,
              "Index status last written: %s" % status_stamp]
-    lines.extend([cfg_line(settings, n) for n in
-                  ("IndexLocalContent", "IndexNetworkConnections",
-                   "SkipServerConnections", "RunEvenLoggedOut")])
+    names = ("IndexLocalContent", "IndexNetworkConnections",
+             "SkipServerConnections", "RunEvenLoggedOut")
+    if error:
+        lines.append("user.config could not be read (%s), so the four index "
+                     "settings below are unknown rather than unset: %s"
+                     % (error, ", ".join(names)))
+    else:
+        lines.extend([cfg_line(settings, n) for n in names])
     network = cfg(settings, "IndexNetworkConnections")
     status = "Info"
     if connection_copies >= INDEX_MANY_CONNECTIONS or network == "True":
@@ -1222,7 +1325,9 @@ def decide_memory(total_gb, free_gb):
         expected="At least %.0f GB for enterprise editing; %.0f GB comfortable."
                  % (MIN_MEMORY_GB, MIN_MEMORY_GB * 2),
         impact="S1 and S2 if the machine is paging during a draw.",
-        fix="None if adequate.")
+        fix="None if adequate.",
+        kpi={"total_gb": total_gb, "free_gb": free_gb,
+             "free_pct": (100.0 * free_gb / total_gb) if total_gb else 0.0})
 
 
 def decide_disk(volumes):
@@ -1242,6 +1347,8 @@ def decide_disk(volumes):
             fix="Read it by hand and re-run.")
     lines = []
     low = False
+    worst_gb = None
+    worst_pct = None
     for name, total, free in volumes:
         free_gb = free / float(1024 ** 3)
         total_gb = total / float(1024 ** 3)
@@ -1250,6 +1357,12 @@ def decide_disk(volumes):
                      % (name, free_gb, total_gb, pct))
         if free_gb < MIN_FREE_DISK_GB or pct < MIN_FREE_DISK_PCT:
             low = True
+        # The worst volume is the one the gauge draws, because a report that
+        # averaged a full system disk with an empty data disk would show a
+        # healthy machine.
+        if worst_pct is None or pct < worst_pct:
+            worst_pct = pct
+            worst_gb = free_gb
     return dict(
         cid="PF-13", category="Hardware", status="Warn" if low else "Pass",
         title="Free disk space on the system and project volumes",
@@ -1260,7 +1373,9 @@ def decide_disk(volumes):
         impact="S1 and S2. A full volume stalls the display cache and the "
                "geoprocessing scratch workspace.",
         fix="Clear the local cache and the leftover session folders first. "
-            "They are the two that grow unattended.")
+            "They are the two that grow unattended.",
+        kpi={"free_gb_worst": worst_gb, "free_pct_worst": worst_pct,
+             "volumes": len(volumes)})
 
 
 def decide_power_plan(guid, name):
@@ -1690,6 +1805,8 @@ def decide_share_latency(rows, omitted=0):
         cid="PF-03", category="Network", status=status,
         title="Directory listing time on the project share",
         observed=lines,
+        kpi={"worst_ms": worst, "warn_ms": SHARE_LIST_WARN_MS,
+             "fail_ms": SHARE_LIST_FAIL_MS, "folders_timed": len(timed)},
         expected="One listing of at most %d entries well under %d ms. Pro "
                  "lists folders many times while it opens a project."
                  % (SHARE_LIST_LIMIT, SHARE_LIST_WARN_MS),
@@ -1831,27 +1948,107 @@ def scan_aprx(path, texts, onedrive, network_drives=()):
     """
     folder = ntpath.dirname(path)
     out = {"path": path, "home": None, "gdb": None, "refresh": [],
-           "parsed": 0}
+           "parsed": 0, "capped": False,
+           # What the newer checks read out of the same documents. Each one
+           # is a count or a list this tool measured, never an inference: an
+           # absent key is an absent key, and the check above it says so.
+           "layers": [], "maps": [], "label_engine": None, "depth": 0}
 
-    def walk(node, name):
-        if isinstance(node, dict):
-            rate = node.get("refreshRate")
-            if isinstance(rate, (int, float)) and not isinstance(rate, bool) \
-                    and rate > 0:
-                out["refresh"].append("%s: %s refreshRate = %s %s"
-                                      % (name, node.get("name", "<unnamed>"),
-                                         rate,
-                                         node.get("refreshRateUnit", "")))
-            for value in node.values():
-                walk(value, name)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value, name)
+    def data_uri(node):
+        """Where a layer's rows come from, as a string this tool can classify."""
+        table = node.get("featureTable")
+        if isinstance(table, dict):
+            conn = table.get("dataConnection")
+            if isinstance(conn, dict):
+                for key in ("workspaceConnectionString", "url", "dataset",
+                            "workspaceFactory"):
+                    value = conn.get(key)
+                    if value:
+                        return "%s" % value
+        conn = node.get("serviceConnectionProperties")
+        if isinstance(conn, dict) and conn.get("url"):
+            return "%s" % conn["url"]
+        return ""
+
+    def layer_record(node, depth):
+        kind = "%s" % node.get("type", "")
+        table = node.get("featureTable") if isinstance(
+            node.get("featureTable"), dict) else {}
+        joins = table.get("joins")
+        labels = node.get("labelClasses")
+        record = {
+            "name": "%s" % node.get("name", "<unnamed>"),
+            "type": kind,
+            "uri": data_uri(node),
+            "wkid": None,
+            "joins": len(joins) if isinstance(joins, list) else 0,
+            "query": bool(node.get("definitionQuery")
+                          or node.get("definitionExpression")
+                          or table.get("definitionExpression")),
+            "labels": len(labels) if isinstance(labels, list) else 0,
+            "scaled": bool(node.get("minScale") or node.get("maxScale")),
+            "depth": depth,
+        }
+        ref = node.get("spatialReference")
+        if isinstance(ref, dict) and ref.get("wkid"):
+            record["wkid"] = ref.get("wkid")
+        out["layers"].append(record)
+        if depth > out["depth"]:
+            out["depth"] = depth
+
+    # An explicit stack, not recursion. A project document nests as deep as
+    # whoever wrote the writer nested it, and the recursive version of this
+    # walk ended the whole check with a RecursionError at about a thousand
+    # levels - which turned one odd project into "no project was read".
+    # Bounded on depth and on node count, because a document that is deep in
+    # one direction is a document this tool did not write.
+    def walk(doc, name):
+        pending = [(doc, 0, 0)]
+        seen = 0
+        while pending:
+            node, depth, group = pending.pop()
+            seen += 1
+            if seen > APRX_MAX_NODES or depth > APRX_MAX_DEPTH:
+                out["capped"] = True
+                return
+            if isinstance(node, dict):
+                kind = node.get("type")
+                if kind == "CIMMap":
+                    ref = node.get("spatialReference")
+                    out["maps"].append((
+                        "%s" % node.get("name", "<unnamed>"),
+                        ref.get("wkid") if isinstance(ref, dict) else None))
+                    placement = node.get("generalPlacementProperties")
+                    if isinstance(placement, dict) \
+                            and placement.get("type") \
+                            and out["label_engine"] is None:
+                        out["label_engine"] = "%s" % placement["type"]
+                if isinstance(kind, str) and kind.startswith("CIM") \
+                        and kind.endswith("Layer"):
+                    layer_record(node, group)
+                rate = node.get("refreshRate")
+                if isinstance(rate, (int, float)) \
+                        and not isinstance(rate, bool) and rate > 0:
+                    out["refresh"].append(
+                        "%s: %s refreshRate = %s %s"
+                        % (name, node.get("name", "<unnamed>"), rate,
+                           node.get("refreshRateUnit", "")))
+                nest = group + 1 if kind == "CIMGroupLayer" else group
+                for value in node.values():
+                    pending.append((value, depth + 1, nest))
+            elif isinstance(node, list):
+                for value in node:
+                    pending.append((value, depth + 1, group))
 
     for name, text in texts:
         try:
             doc = json.loads(text)
         except ValueError:
+            continue
+        except RecursionError:
+            # The parser's own depth limit, hit before the walk. That is a
+            # document this tool declines, not an empty one.
+            out["capped"] = True
             continue
         out["parsed"] += 1
         if isinstance(doc, dict):
@@ -1908,7 +2105,7 @@ def decide_aprx(pro_state, projects, omitted=0):
     remote_gdb = []
     incomplete = []
     for p in projects:
-        if p.get("error") or not p.get("parsed"):
+        if not p.get("parsed"):
             incomplete.append(p["path"])
             lines.append("unreadable  %s  (%s)"
                          % (p["path"], p.get("error")
@@ -1931,8 +2128,11 @@ def decide_aprx(pro_state, projects, omitted=0):
             lines.append("   refresh     : %s" % hit)
         if p.get("truncated"):
             incomplete.append(p["path"])
-            lines.append("   scan capped, so this project was not read in "
-                         "full")
+            if p.get("error"):
+                lines.append("   partly read: %s" % p["error"])
+            else:
+                lines.append("   scan capped, so this project was not read in "
+                             "full")
     if omitted:
         lines.append("%d older recent project(s) were not read." % omitted)
     if hits or remote_gdb:
@@ -2153,16 +2353,29 @@ class Env(object):
                     return entries, unreadable
         return entries, unreadable
 
-    def read_text(self, path):
-        """File contents, or None. Never called on a connection file."""
+    def read_text(self, path, limit=MAX_TEXT_BYTES):
+        """(contents, None) or (None, reason). Never called on a connection
+        file.
+
+        Bounded, and the two failures are told apart. A file this tool did not
+        write, in a folder a sync client may have replaced, is not a file whose
+        size it knows. A caller that cannot distinguish "absent" from "too big
+        to read" reports a missing setting on a machine that has one.
+        """
         try:
             handle = open(path, "rb")
-        except (OSError, IOError):
-            return None
+        except (OSError, IOError) as exc:
+            return None, "%s" % exc
         try:
-            return handle.read().decode("utf-8", "replace")
+            raw = handle.read(limit + 1)
+        except (OSError, IOError) as exc:
+            return None, "%s" % exc
         finally:
             handle.close()
+        if len(raw) > limit:
+            return None, ("larger than the %s this tool will read into memory"
+                          % format_bytes(limit))
+        return raw.decode("utf-8", "replace"), None
 
     def rename(self, src, dst):
         os.rename(src, dst)
@@ -2180,7 +2393,7 @@ class Env(object):
         try:
             import subprocess   # imported here so a plain run never spawns it
             out = subprocess.check_output(
-                ["tasklist", "/FI", "IMAGENAME eq %s" % image, "/NH"],
+                [self.system32("tasklist"), "/FI", "IMAGENAME eq %s" % image, "/NH"],
                 stderr=subprocess.STDOUT)
         except Exception:
             return None
@@ -2233,7 +2446,8 @@ class Env(object):
             return None, None
         try:
             import subprocess
-            out = subprocess.check_output(["powercfg", "/getactivescheme"],
+            out = subprocess.check_output([self.system32("powercfg"),
+                                           "/getactivescheme"],
                                           stderr=subprocess.STDOUT)
             text = out.decode("utf-8", "replace")
         except Exception:
@@ -2262,14 +2476,50 @@ class Env(object):
         except Exception:
             return []
 
+    def resolve(self, host, port, timeout_ms):
+        """(addresses, None) or (None, reason), inside a bounded wait.
+
+        A name lookup has no timeout argument of its own, and a resolver that
+        is down or a DNS server that drops the query can hold one for the
+        system's full retry budget. The whole point of --timeout is that the
+        operator is waiting, so the lookup runs in a thread this method stops
+        waiting for. The thread is a daemon: nothing here can cancel a
+        getaddrinfo already in flight, and holding the run for it would undo
+        the bound.
+
+        Unanswered is its own answer. It is not "the name did not resolve" -
+        that would say the host does not exist when all that happened is that
+        nobody replied - and it is not a closed port either.
+        """
+        import threading
+        box = {}
+
+        def lookup():
+            try:
+                box["infos"] = socket.getaddrinfo(host, port, 0,
+                                                  socket.SOCK_STREAM)
+            except (socket.gaierror, UnicodeError, OSError) as exc:
+                box["error"] = exc
+
+        worker = threading.Thread(target=lookup)
+        worker.daemon = True
+        worker.start()
+        worker.join(timeout_ms / 1000.0)
+        if worker.is_alive():
+            return None, ("the name lookup did not answer within %d ms"
+                          % timeout_ms)
+        if "error" in box:
+            return None, "the name did not resolve: %s" % box["error"]
+        return box.get("infos"), None
+
     def tcp(self, host, port, timeout_ms):
         """One bounded TCP connect. Returns (open, elapsed_ms, error).
 
         open is None, not False, when the name did not resolve: a name that
         never resolved says nothing about the server, and a Fail on it blamed
         a host nobody reached. Every address the name resolves to is tried,
-        IPv6 included, inside one shared deadline. The name lookup itself is
-        not bounded by the timeout.
+        IPv6 included, inside one shared deadline, and the name lookup is
+        bounded by the same allowance.
 
         Bounded on purpose. The obvious connect blocks for tens of seconds
         against a dead host, which would dominate the runtime of a diagnostic
@@ -2281,10 +2531,9 @@ class Env(object):
         def took():
             return int((time.time() - started) * 1000)
 
-        try:
-            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-        except (socket.gaierror, UnicodeError) as exc:
-            return None, took(), "the name did not resolve: %s" % exc
+        infos, error = self.resolve(host, port, timeout_ms)
+        if error:
+            return None, took(), error
         error = "no address"
         for family, kind, proto, _canon, address in infos:
             sock = socket.socket(family, kind, proto)
@@ -2302,6 +2551,22 @@ class Env(object):
 
     powershell = "powershell.exe"
     wevtutil = "wevtutil"
+
+    def system32(self, name):
+        """The absolute path of a program that ships with Windows, or the name.
+
+        Windows searches the current directory for a program named without a
+        path, ahead of PATH. Every child this tool starts is one that ships in
+        System32, so naming it by its full path removes the case where the
+        folder this happens to be run from supplies a different file with the
+        same name. The fallback keeps the tool working on a machine whose
+        SystemRoot is somewhere else, at the cost of that case.
+        """
+        root = self.getenv("SystemRoot")
+        if not root:
+            return name
+        candidate = ntpath.join(root, "System32", name)
+        return candidate if self.isfile(candidate) else name
 
     def _run(self, argv, timeout=120):
         """(returncode, stdout text, first stderr line) of one bounded child."""
@@ -2330,7 +2595,8 @@ class Env(object):
             return None, "PowerShell is read on Windows only"
         try:
             code, out, err = self._run(
-                [self.powershell, "-NoProfile", "-NonInteractive", "-Command",
+                [self.system32(self.powershell), "-NoProfile",
+                 "-NonInteractive", "-Command",
                  "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding "
                  "= [Text.Encoding]::UTF8; " + script])
         except Exception as exc:
@@ -2361,6 +2627,53 @@ class Env(object):
             "$(if ($pm) { [string]$pm.AllowComputerToTurnOffDevice } else "
             "{ $null })} }); ConvertTo-Json -Compress -InputObject $r")
 
+    def disk_media(self):
+        """[(friendly name, media type)] for each physical disk, or (None,
+        reason).
+
+        MediaType answers SSD, HDD or Unspecified. Unspecified is common on a
+        disk behind a RAID or storage-space controller, and it is reported as
+        its own answer rather than read as either.
+        """
+        data, error = self._powershell_json(
+            "$d = @(Get-PhysicalDisk | ForEach-Object { [pscustomobject]@{"
+            "name = $_.FriendlyName; media = [string]$_.MediaType} }); "
+            "ConvertTo-Json -Compress -InputObject $d")
+        return _ps_rows(data, "name", "media"), error
+
+    def link_speed(self):
+        """[(adapter name, link speed)] for each adapter that is up, or (None,
+        reason).
+
+        The negotiated speed, not the rated one. An adapter rated for gigabit
+        and linked at a hundred megabit is a cable or a switch port, and it
+        presents as a slow server.
+        """
+        data, error = self._powershell_json(
+            "$a = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | "
+            "ForEach-Object { [pscustomobject]@{name = $_.Name; speed = "
+            "[string]$_.LinkSpeed} }); ConvertTo-Json -Compress -InputObject $a")
+        return _ps_rows(data, "name", "speed"), error
+
+    def pagefile(self):
+        """([entries], None) or (None, reason) from the boot-time setting.
+
+        An empty list means system managed, which is an answer and not a
+        failed read: Windows decides the size at boot and does not write the
+        number here.
+        """
+        if not self.windows:
+            return None, "the pagefile setting is read on Windows only"
+        value = self.reg(
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager"
+            r"\Memory Management", "PagingFiles")
+        if value is None:
+            return None, ("no PagingFiles value could be read, which is not "
+                          "the same as the pagefile being off")
+        if isinstance(value, (list, tuple)):
+            return ["%s" % v for v in value], None
+        return ["%s" % value], None
+
     def smb_client(self):
         """The SMB client settings PF-02 reads, as a dict, or (None, reason)."""
         return self._powershell_json(
@@ -2382,7 +2695,8 @@ class Env(object):
             return None, "the event log is read on Windows only"
         try:
             code, out, err = self._run(
-                [self.wevtutil, "qe", log, "/q:" + query, "/c:%d" % count,
+                [self.system32(self.wevtutil), "qe", log, "/q:" + query,
+                 "/c:%d" % count,
                  "/rd:true", "/f:xml", "/e:Events"])
         except Exception as exc:
             return None, "%s: %s" % (type(exc).__name__, exc)
@@ -2408,29 +2722,68 @@ class Env(object):
                       max_entry=APRX_MAX_ENTRY_BYTES, max_total=APRX_MAX_BYTES):
         """([(name, text)], truncated, None) or ([], False, reason).
 
-        Only .json entries are read, each and all of them bounded.
+        Only .json entries are read, each and all of them bounded, and the
+        bound is enforced on the bytes actually decompressed rather than on the
+        size the archive header claims. A zip header is a number the file's
+        author chose, and Python's reader stops at it, so trusting it both
+        understates the cap for a lying header and turns a corrupt entry into
+        an exception that escapes this function.
+
+        One entry that fails is reported and the walk goes on. A project whose
+        third document is corrupt still answers for its first two, which is
+        more than a check that reports nothing about any of them.
         """
         import zipfile
         out = []
+        unreadable = []
         truncated = False
         total = 0
         try:
             archive = zipfile.ZipFile(path)
-        except (OSError, IOError, zipfile.BadZipfile) as exc:
+        except (OSError, IOError, zipfile.BadZipfile, ValueError) as exc:
             return [], False, "%s" % exc
         try:
             for info in archive.infolist():
                 if not info.filename.lower().endswith(".json"):
                     continue
-                if (len(out) >= max_entries or info.file_size > max_entry
-                        or total + info.file_size > max_total):
+                if len(out) >= max_entries or total >= max_total:
                     truncated = True
                     continue
-                total += info.file_size
+                budget = min(max_entry, max_total - total)
+                chunks = []
+                got = 0
+                try:
+                    handle = archive.open(info, "r")
+                    try:
+                        # Read to the cap or to the end of the entry. Going
+                        # all the way to the end is what makes the archive's
+                        # own CRC check run: a header that understates the
+                        # entry hands back its own short read and then fails
+                        # the checksum, which is the difference between a
+                        # truncated document that looks fine and one that is
+                        # reported.
+                        while got <= budget:
+                            block = handle.read(min(65536, budget + 1 - got))
+                            if not block:
+                                break
+                            chunks.append(block)
+                            got += len(block)
+                    finally:
+                        handle.close()
+                except (OSError, IOError, zipfile.BadZipfile, ValueError,
+                        NotImplementedError) as exc:
+                    unreadable.append("%s: %s" % (info.filename, exc))
+                    continue
+                if got > budget:
+                    truncated = True
+                    continue
+                total += got
                 out.append((info.filename,
-                            archive.read(info).decode("utf-8", "replace")))
+                            b"".join(chunks).decode("utf-8", "replace")))
         finally:
             archive.close()
+        if unreadable:
+            return out, truncated, "; ".join(unreadable)
         return out, truncated, None
 
 
@@ -2469,10 +2822,18 @@ def user_config_path(env):
 
 
 def read_settings(env, path):
-    """The parsed user.config, or an empty mapping."""
+    """(parsed user.config, None) or (empty mapping, reason).
+
+    A file nobody could read is not a file whose settings are all absent, and
+    the two must not reach the same branch: `<absent>` is a real answer, and a
+    verdict built on it describes a setting that may be set.
+    """
     if not path:
-        return {}
-    return parse_user_config(env.read_text(path))
+        return {}, None
+    text, error = env.read_text(path)
+    if error:
+        return {}, error
+    return parse_user_config(text), None
 
 
 def onedrive_roots(env):
@@ -2531,11 +2892,12 @@ def probe_session(env, facts):
 def probe_backup(env, facts):
     path = user_config_path(env)
     facts["user_config"] = path
-    settings = read_settings(env, path)
+    settings, error = read_settings(env, path)
     facts["settings"] = settings
+    facts["settings_error"] = error
     recent = facts.get("recent") or []
     home = recent[0][2] if recent else "unknown"
-    return decide_backup(path, settings, home)
+    return decide_backup(path, settings, home, error)
 
 
 def probe_storage(env, facts):
@@ -2709,7 +3071,8 @@ def probe_pro_version(env, facts):
 
 
 def probe_rendering(env, facts):
-    return decide_rendering(facts.get("user_config"), facts.get("settings"))
+    return decide_rendering(facts.get("user_config"), facts.get("settings"),
+                            facts.get("settings_error"))
 
 
 def probe_caches(env, facts):
@@ -2749,7 +3112,8 @@ def probe_index(env, facts):
             if e.name.lower() == "status.cfg":
                 status_stamp = stamp(e.mtime)
     return decide_index(sum([e.size for e in files]), len(files), connections,
-                        status_stamp, facts.get("settings"))
+                        status_stamp, facts.get("settings"),
+                        facts.get("settings_error"))
 
 
 def probe_gpu_preference(env, facts):
@@ -2917,24 +3281,741 @@ def probe_defender(env, facts):
 
 
 def probe_aprx(env, facts):
+    """PF-22. Shares the one project-file read with PF-01, PF-09, PF-10 and
+    PF-14."""
+    projects, state, omitted = aprx_projects(env, facts)
+    return decide_aprx(state, projects, omitted)
+
+
+def aprx_projects(env, facts):
+    """The parsed recent projects, read once and shared by every check.
+
+    Cached in facts on purpose. Five checks read the project file, and each
+    read holds it open; doing it five times would be five chances to contend
+    with a save, which is the failure this tool refuses to cause. Returns
+    (projects, state, omitted) where state is "closed", "running" or
+    "unknown".
+    """
+    if "aprx" in facts:
+        return facts["aprx"]
     running = facts.get("pro_running")
     state = ("unknown" if running is None
              else "running" if running else "closed")
-    if state != "closed":
-        return decide_aprx(state, [])
-    onedrive = onedrive_roots(env)
-    network = env.network_drives()
-    recent = facts.get("recent") or []
     projects = []
-    for path, _when, _cls in recent[:APRX_MAX_PROJECTS]:
-        texts, truncated, error = env.read_zip_json(path)
-        if error:
-            projects.append({"path": path, "error": error})
+    omitted = 0
+    if state == "closed":
+        onedrive = onedrive_roots(env)
+        network = env.network_drives()
+        recent = facts.get("recent") or []
+        for path, _when, _cls in recent[:APRX_MAX_PROJECTS]:
+            texts, truncated, error = env.read_zip_json(path)
+            if error and not texts:
+                projects.append({"path": path, "error": error})
+                continue
+            found = scan_aprx(path, texts, onedrive, network)
+            # A document the walk declined is a partial reading too: the
+            # timer could have been in the part that was never reached.
+            found["truncated"] = (truncated or bool(error)
+                                  or found.get("capped"))
+            if error:
+                found["error"] = error
+            projects.append(found)
+        omitted = max(len(recent) - APRX_MAX_PROJECTS, 0)
+    result = (projects, state, omitted)
+    facts["aprx"] = result
+    return result
+
+
+def probe_projection(env, facts):
+    projects, state, _omitted = aprx_projects(env, facts)
+    if state != "closed":
+        return dict(
+            cid="PF-01", category="ArcGISPro", status="Info", measured=False,
+            title="Coordinate systems in the project (on-the-fly projection)",
+            observed="No project file was opened: %s. Nothing was compared."
+                     % ("ArcGIS Pro is running" if state == "running"
+                        else "whether ArcGIS Pro is running was not "
+                             "determined"),
+            expected="Pro closed, so the project can be read.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it in Pro: the map's Properties > Coordinate Systems.")
+    return decide_projection(projects)
+
+
+def probe_http_layers(env, facts):
+    projects, state, _omitted = aprx_projects(env, facts)
+    if state != "closed":
+        return dict(
+            cid="PF-09", category="Network", status="Info", measured=False,
+            title="Layers served over the network by URL",
+            observed="No project file was opened: %s."
+                     % ("ArcGIS Pro is running" if state == "running"
+                        else "whether ArcGIS Pro is running was not "
+                             "determined"),
+            expected="Pro closed, so the project can be read.",
+            impact="S1 and S2 undetermined.",
+            fix="Read the layer list in Pro's Contents pane.")
+    return decide_http_layers(projects)
+
+
+def probe_project_weight(env, facts):
+    projects, state, _omitted = aprx_projects(env, facts)
+    sizes = []
+    for path, _when, _cls in (facts.get("recent") or [])[:APRX_MAX_PROJECTS]:
+        try:
+            sizes.append((path, os.stat(path).st_size))
+        except OSError:
+            pass
+    if state != "closed":
+        return decide_project_weight([], sizes)
+    return decide_project_weight(projects, sizes)
+
+
+def probe_layer_load(env, facts):
+    projects, state, _omitted = aprx_projects(env, facts)
+    if state != "closed":
+        return dict(
+            cid="PF-14", category="ArcGISPro", status="Info", measured=False,
+            title="Per-layer draw load: joins, queries, labels, visibility",
+            observed="No project file was opened: %s."
+                     % ("ArcGIS Pro is running" if state == "running"
+                        else "whether ArcGIS Pro is running was not "
+                             "determined"),
+            expected="Pro closed, so the project can be read.",
+            impact="S1, S2 and S4 undetermined.",
+            fix="Read it per layer in Pro.")
+    return decide_layer_load(projects)
+
+
+def probe_overviews(env, facts):
+    """PF-16. Rasters under the recent project folders, and their sidecars.
+
+    The same depth and entry bound as every other walk here: a full recursive
+    scan of a synced project tree can hydrate every file it touches, which is
+    the condition being measured.
+    """
+    roots = []
+    seen = set()
+    for path, _when, _cls in (facts.get("recent") or [])[:APRX_MAX_PROJECTS]:
+        folder = ntpath.dirname(path)
+        key = _norm(folder)
+        if folder and key not in seen:
+            seen.add(key)
+            roots.append(folder)
+    if not roots:
+        return decide_overviews([], set(), [])
+    rasters = []
+    with_overview = set()
+    unreadable = []
+    for root in roots:
+        entries, bad = env.scan(root, depth=3, limit=5000)
+        unreadable.extend(bad)
+        names = set([_norm(e.name) for e in entries])
+        for e in entries:
+            if e.isdir:
+                continue
+            low = e.name.lower()
+            if low.endswith(RASTER_EXTENSIONS):
+                rasters.append(e.path)
+                stem = e.path[:-len(ntpath.splitext(low)[1])] if "." in low \
+                    else e.path
+                for sidecar in (".ovr", ".aux.xml"):
+                    if _norm(ntpath.basename(stem + sidecar)) in names:
+                        with_overview.add(e.path)
+                        break
+    return decide_overviews(rasters, with_overview, unreadable)
+
+
+def probe_disk_media(env, facts):
+    disks, error = env.disk_media()
+    return decide_disk_media(disks or [], error)
+
+
+def probe_pagefile(env, facts):
+    files, error = env.pagefile()
+    return decide_pagefile(files or [], error)
+
+
+def probe_link_speed(env, facts):
+    adapters, error = env.link_speed()
+    return decide_link_speed(adapters or [], error)
+
+
+# =============================================================================
+# THE DOCUMENTED PERFORMANCE CAUSES. Same contract as everything above: a
+# check that could not read says so, and never carries a verdict.
+# =============================================================================
+
+# Raster formats whose absence of overviews is a documented draw cost. The
+# sidecar names are the two Pro writes: .ovr beside the raster, or .aux.xml.
+RASTER_EXTENSIONS = (".tif", ".tiff", ".img", ".jp2", ".bmp", ".gif", ".png",
+                     ".jpg", ".jpeg", ".ecw", ".sid")
+
+
+def _ps_rows(data, name_key, value_key):
+    """[(name, value)] out of one ConvertTo-Json answer.
+
+    PowerShell answers a single object where a list was expected, because
+    ConvertTo-Json drops the array wrapper for one row. Unwrapping it here
+    rather than at each call site is what keeps a machine with exactly one
+    disk from reading as a machine with none.
+    """
+    if not isinstance(data, list):
+        data = [data]
+    out = []
+    for row in data:
+        if isinstance(row, dict):
+            out.append(("%s" % (row.get(name_key) or "<unnamed>"),
+                        row.get(value_key) or None))
+    return out
+
+
+def is_http_uri(uri):
+    """True for a data connection that crosses the network by URL.
+
+    Classified from the scheme, not from a hostname: an offline machine and a
+    VPN drop both make these layers the slow part of the draw, and the report
+    should say that rather than guess at the reason.
+    """
+    low = (uri or "").strip().lower()
+    return low.startswith("http://") or low.startswith("https://")
+
+
+def wkid_label(wkid):
+    """A spatial reference this report can compare, or None."""
+    if wkid is None:
+        return None
+    try:
+        return int(wkid)
+    except (TypeError, ValueError):
+        return None
+
+
+def decide_projection(projects):
+    """PF-01. Coordinate systems in the project, and whether they agree.
+
+    A layer whose spatial reference differs from the map's is reprojected on
+    every draw. Pro calls this on-the-fly projection and does it silently, so
+    the editor sees a slow map and no message. It is one of the most common
+    answers on a machine that is otherwise healthy.
+
+    Only the spatial references the project file actually carries are compared.
+    A layer with none recorded is not a mismatch: it inherits the map's, and
+    calling that a mismatch would be a verdict about something the file does
+    not say.
+    """
+    title = "Coordinate systems in the project (on-the-fly projection)"
+    if not projects:
+        return dict(
+            cid="PF-01", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project file was read this run, so no coordinate "
+                     "system was compared.",
+            expected="Every layer in the map's own coordinate system.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it in Pro: the map's Properties > Coordinate Systems, "
+                "against each layer's Source tab.")
+    maps = []
+    layers = []
+    incomplete = []
+    for p in projects:
+        if not p.get("parsed"):
             continue
-        found = scan_aprx(path, texts, onedrive, network)
-        found["truncated"] = truncated
-        projects.append(found)
-    return decide_aprx(state, projects, max(len(recent) - APRX_MAX_PROJECTS, 0))
+        if p.get("truncated") or p.get("error"):
+            incomplete.append(p["path"])
+        maps.extend(p.get("maps") or [])
+        layers.extend(p.get("layers") or [])
+    map_wk = set([w for _n, w in maps if wkid_label(w) is not None])
+    layer_wk = set([wkid_label(l["wkid"]) for l in layers
+                    if wkid_label(l["wkid"]) is not None])
+    if not map_wk and not layer_wk:
+        return dict(
+            cid="PF-01", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed=["%d project document(s) were read and not one of them "
+                      "records a spatial reference this tool can compare."
+                      % len(projects)]
+                     + (["partly read: %s" % ", ".join(incomplete)]
+                        if incomplete else []),
+            expected="A spatial reference recorded on the map and on the "
+                     "layers.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it in Pro: the map's Properties > Coordinate Systems.")
+    mismatch = sorted(layer_wk - map_wk) if map_wk else []
+    lines = ["map coordinate system(s): %s"
+             % (", ".join(str(w) for w in sorted(map_wk)) or "<none recorded>"),
+             "layer coordinate system(s): %s"
+             % (", ".join(str(w) for w in sorted(layer_wk)) or "<none recorded>")]
+    if mismatch:
+        lines.append("layers in a different system, reprojected on every draw: "
+                     "%s" % ", ".join(str(w) for w in mismatch))
+    if len(map_wk) > 1:
+        lines.append("more than one map coordinate system is recorded in this "
+                     "project")
+    if incomplete:
+        lines.append("partly read, so the comparison is not complete: %s"
+                     % ", ".join(incomplete))
+    status = "Warn" if mismatch else ("Info" if incomplete else "Pass")
+    return dict(
+        cid="PF-01", category="ArcGISPro", status=status, title=title,
+        observed=lines,
+        expected="Every layer stored in the map's own coordinate system, so "
+                 "nothing is reprojected during a draw.",
+        impact="S1 and S2. A layer in a different system is reprojected on "
+               "every draw, and Pro does it without saying so.",
+        fix="Project the data once, offline, with the Project tool into the "
+            "map's coordinate system, and point the layer at the result. "
+            "Setting the map to the layer's system only moves the cost to the "
+            "other layers. Do not do it to a layer that is being edited: "
+            "project a copy.")
+
+
+def decide_http_layers(projects):
+    """PF-09. Layers whose rows come from a URL.
+
+    An online basemap or a feature service draws over the network on every
+    pan and zoom. On a laptop that has lost the VPN, or a workstation whose
+    portal is across a slow link, that is the whole of the stall, and it is
+    invisible in every local reading this report makes.
+    """
+    title = "Layers served over the network by URL"
+    if not projects:
+        return dict(
+            cid="PF-09", category="Network", status="Info", measured=False,
+            title=title,
+            observed="No project file was read this run, so no layer's source "
+                     "was classified.",
+            expected="Basemaps and service layers understood as network "
+                     "draws, not as local ones.",
+            impact="S1 and S2 undetermined.",
+            fix="Read the layer list in Pro's Contents pane.")
+    served = []
+    local = 0
+    incomplete = []
+    for p in projects:
+        if not p.get("parsed"):
+            continue
+        if p.get("truncated") or p.get("error"):
+            incomplete.append(p["path"])
+        for layer in p.get("layers") or []:
+            if is_http_uri(layer["uri"]):
+                served.append("%s  (%s)" % (layer["name"], layer["uri"]))
+            elif layer["uri"]:
+                local += 1
+    lines = ["%d layer(s) draw over the network by URL" % len(served)]
+    lines.extend(["   %s" % s for s in served[:20]])
+    if len(served) > 20:
+        lines.append("   and %d more" % (len(served) - 20))
+    lines.append("%d layer(s) draw from a file or a database connection"
+                 % local)
+    if incomplete:
+        lines.append("partly read: %s" % ", ".join(incomplete))
+    if len(served) >= HTTP_LAYERS_WARN:
+        status = "Warn"
+    elif served:
+        status = "Info"
+    else:
+        status = "Info" if incomplete else "Pass"
+    return dict(
+        cid="PF-09", category="Network", status=status, title=title,
+        observed=lines,
+        kpi={"http_layers": len(served), "local_layers": local,
+             "warn_at": HTTP_LAYERS_WARN},
+        expected="A small number of service layers, understood as network "
+                 "draws, with the working data local.",
+        impact="S1 and S2. These draw over the network on every pan and zoom. "
+               "Off the VPN, or on a slow link to the portal, they are the "
+               "whole of the stall.",
+        fix="Take the working layers local: export the ones that are edited "
+            "to a file geodatabase on a local disk, and keep the online "
+            "basemap as the only network draw. Where a basemap must stay "
+            "online, turn it off while editing.")
+
+
+def decide_project_weight(projects, sizes):
+    """PF-10. How big and how deep the project is.
+
+    Not a fault. A project with two hundred layers in six nested groups opens
+    slowly because of what is in it, and reporting that is what stops the rest
+    of this report being read as the whole story.
+    """
+    title = "Project weight: layers, group depth and file size"
+    if not projects and not sizes:
+        return dict(
+            cid="PF-10", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project was found to weigh.",
+            expected="A project small enough to open quickly.",
+            impact="S1 undetermined.",
+            fix="None.")
+    lines = []
+    worst_layers = 0
+    worst_depth = 0
+    counted = 0
+    for p in projects:
+        if not p.get("parsed"):
+            continue
+        counted += 1
+        layers = len(p.get("layers") or [])
+        depth = p.get("depth") or 0
+        worst_layers = max(worst_layers, layers)
+        worst_depth = max(worst_depth, depth)
+        lines.append("%s: %d layer(s), group depth %d" % (p["path"], layers,
+                                                          depth))
+    for path, size in sizes:
+        lines.append("%s: %s" % (path, format_bytes(size)))
+    if counted:
+        if worst_layers >= LAYERS_MANY or worst_depth >= GROUP_DEEP_WARN \
+                or any(s >= APRX_BIG_BYTES for _p, s in sizes):
+            status = "Warn"
+        elif worst_layers >= LAYERS_WARN:
+            status = "Info"
+        else:
+            status = "Pass"
+    else:
+        return dict(
+            cid="PF-10", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project document could be read, so nothing was "
+                     "weighed. Sizes alone are not a project weight.",
+            expected="A project small enough to open quickly.",
+            impact="S1 undetermined.",
+            fix="None.")
+    return dict(
+        cid="PF-10", category="ArcGISPro", status=status, title=title,
+        observed=lines,
+        kpi={"layers": worst_layers, "group_depth": worst_depth,
+             "aprx_bytes": max([s for _p, s in sizes]) if sizes else 0},
+        expected="Fewer than %d layers, no more than %d levels of group "
+                 "nesting, and a project file under %s. Warn at %d layers or "
+                 "%d deep." % (LAYERS_WARN, GROUP_DEEP_WARN,
+                               format_bytes(APRX_BIG_BYTES), LAYERS_MANY,
+                               GROUP_DEEP_WARN),
+        impact="S1. A project this size is slow to open and slow to save "
+               "because of what is in it, which is a different fix from every "
+               "other finding in this report.",
+        fix="Split the project: one map per task, and the layers that are not "
+            "used moved to their own project. Ungroup what does not need a "
+            "group. A layer that is turned off still costs its place in the "
+            "project file.")
+
+
+def decide_layer_load(projects):
+    """PF-14. The per-layer work a draw has to do.
+
+    Joins, definition queries, label expressions and visibility ranges are all
+    read from the project file. None of them is wrong; together they are the
+    reason a map with forty layers draws like one with four hundred.
+    """
+    title = "Per-layer draw load: joins, queries, labels, visibility"
+    if not projects:
+        return dict(
+            cid="PF-14", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project file was read this run.",
+            expected="A draw that does not re-join and re-query on every "
+                     "refresh.",
+            impact="S1, S2 and S4 undetermined.",
+            fix="Read it per layer in Pro.")
+    joins = []
+    join_total = 0
+    queries = 0
+    labels = 0
+    scaled = 0
+    engines = set()
+    counted = 0
+    incomplete = []
+    for p in projects:
+        if not p.get("parsed"):
+            continue
+        if p.get("truncated") or p.get("error"):
+            incomplete.append(p["path"])
+        counted += 1
+        if p.get("label_engine"):
+            engines.add(p["label_engine"])
+        for layer in p.get("layers") or []:
+            if layer["joins"]:
+                # The count that matters is the joins, not the layers carrying
+                # one. Three joins on a single layer cost three
+                # re-evaluations per draw, and grading on the number of
+                # layers would report that as one.
+                joins.append("%s: %d join(s)" % (layer["name"],
+                                                 layer["joins"]))
+                join_total += layer["joins"]
+            if layer["query"]:
+                queries += 1
+            if layer["labels"]:
+                labels += 1
+            if layer["scaled"]:
+                scaled += 1
+    if not counted:
+        return dict(
+            cid="PF-14", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="No project document could be read.",
+            expected="A draw that does not re-join and re-query on every "
+                     "refresh.",
+            impact="S1, S2 and S4 undetermined.",
+            fix="Read it per layer in Pro.")
+    lines = ["%d join(s) across %d layer(s)" % (join_total, len(joins))]
+    lines.extend(["   %s" % j for j in joins[:10]])
+    lines.append("%d layer(s) carry a definition query" % queries)
+    lines.append("%d layer(s) are labelled" % labels)
+    lines.append("%d layer(s) draw only inside a visibility range" % scaled)
+    lines.append("label engine: %s" % (", ".join(sorted(engines))
+                                       or "<not recorded>"))
+    if incomplete:
+        lines.append("partly read: %s" % ", ".join(incomplete))
+    status = "Warn" if join_total >= JOINS_WARN else "Info"
+    return dict(
+        cid="PF-14", category="ArcGISPro", status=status, title=title,
+        observed=lines,
+        expected="Joins made permanent where the join is permanent, definition "
+                 "queries on the source rather than on the draw, and the "
+                 "label engine understood: Maplex places better and costs "
+                 "more.",
+        impact="S1, S2 and S4. A join is re-evaluated on every draw, a "
+               "definition query on every refresh, and a label expression on "
+               "every placement pass.",
+        fix="Make a permanent join permanent: run Join Field, or export the "
+            "joined result, and point the layer at that instead. Move a "
+            "definition query into the source where the data allows it. Turn "
+            "labelling off on the layers that do not need it, and consider the "
+            "standard engine where Maplex placement is not being used.")
+
+
+def decide_overviews(rasters, with_overview, unreadable):
+    """PF-16. Rasters with no overviews beside them.
+
+    A raster with no pyramid is read at full resolution and thinned on the
+    screen, every draw. Building them once costs minutes; not building them
+    costs the same minutes on every pan for the life of the project.
+    """
+    title = "Raster overviews (pyramids) in the project folder"
+    if unreadable and not rasters:
+        return dict(
+            cid="PF-16", category="ArcGISPro", status="Info", measured=False,
+            title=title,
+            observed="The project folder could not be read: %s. Nothing was "
+                     "counted, which is not the same as finding none."
+                     % "; ".join(unreadable[:4]),
+            expected="An overview beside every raster.",
+            impact="S1 and S4 undetermined.",
+            fix="Look for a .ovr or .aux.xml beside each raster.")
+    if not rasters:
+        return dict(
+            cid="PF-16", category="ArcGISPro", status="Info",
+            title=title,
+            observed="No raster file was found under the recent project "
+                     "folders that this tool looks at.",
+            expected="An overview beside every raster.",
+            impact="None found here.",
+            fix="If the rasters live elsewhere, build overviews there with "
+                "the Build Pyramids tool.")
+    missing = [r for r in rasters if r not in with_overview]
+    lines = ["%d raster file(s) under the project folder, %d with an overview "
+             "beside them" % (len(rasters), len(with_overview))]
+    lines.extend(["   no overview: %s" % m for m in missing[:10]])
+    if len(missing) > 10:
+        lines.append("   and %d more" % (len(missing) - 10))
+    if unreadable:
+        lines.append("folders that could not be read: %s"
+                     % "; ".join(unreadable[:4]))
+    status = "Warn" if missing else "Pass"
+    return dict(
+        cid="PF-16", category="ArcGISPro", status=status, title=title,
+        observed=lines,
+        expected="An .ovr or .aux.xml beside every raster, built once.",
+        impact="S1 and S4. A raster with no pyramid is read at full "
+               "resolution and thinned on screen, on every draw.",
+        fix="Run Build Pyramids over the raster folder once, with Pro closed. "
+            "It writes the sidecar and does not touch the raster. On a share, "
+            "copy the rasters local first: building pyramids over the network "
+            "is slow and leaves the sidecar there too.")
+
+
+def decide_disk_media(disks, error):
+    """PF-18. What the volumes are physically made of.
+
+    The one hardware finding no setting fixes. A rotational disk holding the
+    display cache, the scratch workspace and the project is the most common
+    hardware cause of a slow session, and it reads as a mystery because every
+    software setting on the machine is correct.
+    """
+    title = "Disk media type under the caches and the project"
+    if error:
+        return dict(
+            cid="PF-18", category="Hardware", status="Info", measured=False,
+            title=title,
+            observed="The disk list could not be read: %s. An unread list is "
+                     "not a disk that is fine." % error,
+            expected="SSD under the caches, the scratch workspace and the "
+                     "project.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it by hand: Get-PhysicalDisk | Select FriendlyName, "
+                "MediaType.")
+    if not disks:
+        return dict(
+            cid="PF-18", category="Hardware", status="Info", measured=False,
+            title=title,
+            observed="The disk list came back empty, so no media type was "
+                     "read.",
+            expected="SSD under the caches, the scratch workspace and the "
+                     "project.",
+            impact="S1 and S2 undetermined.",
+            fix="Read it by hand: Get-PhysicalDisk.")
+    lines = ["%s: %s" % (name, media or "<not reported>")
+             for name, media in disks]
+    slow = [name for name, media in disks
+            if (media or "").upper() in DISK_MEDIA_WARN]
+    status = "Warn" if slow else "Pass"
+    if slow:
+        lines.append("rotational or unreported: %s" % ", ".join(slow))
+    return dict(
+        cid="PF-18", category="Hardware", status=status, title=title,
+        observed=lines,
+        expected="SSD. A rotational disk under the caches and the project is "
+                 "the most common hardware cause of a slow session, and no "
+                 "setting fixes it.",
+        impact="S1 and S2. Every cache write, every scratch workspace and "
+               "every project save waits on the platter.",
+        fix="Move the ESRI cache folder and the geoprocessing scratch "
+            "workspace to the fastest local volume: Project > Options > "
+            "General for the scratch workspace, and the Cache Path value "
+            "under HKCU\\Software\\ESRI\\ArcGISPro\\Settings for the cache. "
+            "Then move the project. Nothing in this report helps until the "
+            "disk does.")
+
+
+def decide_pagefile(files, error):
+    """PF-20. The pagefile, and where it lives.
+
+    Read from the registry value, which is what Windows reads at boot. A
+    pagefile on a network volume is a stall that appears in no Pro log, and a
+    pagefile that is too small turns a memory spike into a hard failure
+    instead of a slow one.
+    """
+    title = "Pagefile size and location"
+    if error:
+        return dict(
+            cid="PF-20", category="System", status="Info", measured=False,
+            title=title,
+            observed="The pagefile setting could not be read: %s." % error,
+            expected="A system-managed pagefile on a local disk.",
+            impact="S2 undetermined.",
+            fix="Read it in Windows: System > Advanced > Performance > "
+                "Advanced > Virtual memory.")
+    if not files:
+        return dict(
+            cid="PF-20", category="System", status="Info",
+            title=title,
+            observed="The pagefile is set to system managed, so its size is "
+                     "decided by Windows at boot and this tool cannot read "
+                     "the number it chose.",
+            expected="A system-managed pagefile on a local disk.",
+            impact="S2. System managed is the safe default; the size is not "
+                   "readable from here.",
+            fix="None unless the machine is running out of memory, in which "
+                "case set an explicit initial size on a local disk.")
+    lines = list(files)
+    remote = [f for f in files if is_network_path(f.split(" ")[0])]
+    small = [f for f in files if _pagefile_mb(f) is not None
+             and _pagefile_mb(f) < PAGEFILE_MIN_MB]
+    status = "Fail" if remote else ("Warn" if small else "Pass")
+    if remote:
+        lines.append("on a network volume: %s" % ", ".join(remote))
+    if small:
+        lines.append("below %d MB: %s" % (PAGEFILE_MIN_MB, ", ".join(small)))
+    return dict(
+        cid="PF-20", category="System", status=status, title=title,
+        observed=lines,
+        expected="A pagefile of at least %d MB on a local disk."
+                 % PAGEFILE_MIN_MB,
+        impact="S2. A pagefile on a network volume is a multi-second stall "
+               "that appears in no Pro log. One that is too small turns a "
+               "memory spike into a failure instead of a pause.",
+        fix="System > Advanced > Performance Settings > Advanced > Virtual "
+            "memory: put it on a local disk, system managed or with an "
+            "explicit initial size, then restart.")
+
+
+def _pagefile_mb(entry):
+    """The initial size in MB out of one PagingFiles entry, or None."""
+    parts = (entry or "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def decide_link_speed(adapters, error):
+    """PF-21. What the adapters actually negotiated.
+
+    An adapter configured for gigabit and linked at a hundred megabit is a
+    cable, a switch port or a power-saving setting, and it presents as a slow
+    server. Nothing in the SMB settings explains it.
+    """
+    title = "Network adapter link speed"
+    if error:
+        return dict(
+            cid="PF-21", category="Network", status="Info", measured=False,
+            title=title,
+            observed="The adapter list could not be read: %s." % error,
+            expected="%d Mbit or better on the adapter carrying the database "
+                     "session." % LINK_SPEED_MIN_MBPS,
+            impact="S1, S2 and S3 undetermined.",
+            fix="Read it by hand: Get-NetAdapter | Select Name, LinkSpeed.")
+    if not adapters:
+        return dict(
+            cid="PF-21", category="Network", status="Info", measured=False,
+            title=title,
+            observed="No adapter that is up reported a link speed.",
+            expected="%d Mbit or better." % LINK_SPEED_MIN_MBPS,
+            impact="S1, S2 and S3 undetermined.",
+            fix="Read it by hand: Get-NetAdapter.")
+    lines = ["%s: %s" % (name, speed) for name, speed in adapters]
+    slow = [(name, speed) for name, speed in adapters
+            if _mbps(speed) is not None and _mbps(speed) < LINK_SPEED_MIN_MBPS]
+    unknown = [name for name, speed in adapters if _mbps(speed) is None]
+    if slow:
+        lines.append("below %d Mbit: %s" % (
+            LINK_SPEED_MIN_MBPS,
+            ", ".join("%s (%s)" % pair for pair in slow)))
+    if unknown and not slow:
+        return dict(
+            cid="PF-21", category="Network", status="Info", measured=False,
+            title=title, observed=lines,
+            expected="%d Mbit or better." % LINK_SPEED_MIN_MBPS,
+            impact="S1, S2 and S3 undetermined.",
+            fix="Read it by hand: Get-NetAdapter | Select Name, LinkSpeed.")
+    status = "Warn" if slow else "Pass"
+    speeds = [_mbps(v) for _n, v in adapters]
+    known = [v for v in speeds if v is not None]
+    return dict(
+        cid="PF-21", category="Network", status=status, title=title,
+        observed=lines,
+        kpi={"worst_mbps": min(known) if known else 0,
+             "min_mbps": LINK_SPEED_MIN_MBPS, "adapters": len(adapters)},
+        expected="%d Mbit or better on the adapter carrying the database "
+                 "session." % LINK_SPEED_MIN_MBPS,
+        impact="S1, S2 and S3. A gigabit adapter linked at a hundred megabit "
+               "presents as a slow server, and nothing in the SMB settings "
+               "explains it.",
+        fix="Check the cable and the switch port, then the adapter's speed "
+            "and duplex setting in Device Manager. On a docking station, the "
+            "dock is often the limit.")
+
+
+def _mbps(speed):
+    """Megabits per second out of a Get-NetAdapter LinkSpeed string, or None."""
+    text = (speed or "").strip().lower()
+    match = re.search(r"([\d.]+)\s*(gbps|mbps|gbit|mbit|gb|mb)", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value * 1000.0 if match.group(2).startswith("g") else value
 
 
 # =============================================================================
@@ -2978,6 +4059,8 @@ def registrations(env, facts, opts):
         ("PF-07", "Cache", "Leftover session folders", True,
          lambda: probe_protemp(env, facts)),
 
+        ("PF-01", "ArcGISPro", "Coordinate systems in the project", False,
+         lambda: probe_projection(env, facts)),
         ("PF-02", "Network", "SMB client configuration", False,
          lambda: probe_smb(env, facts)),
         ("PF-03", "Network", "Directory listing time on the project share",
@@ -2990,18 +4073,32 @@ def registrations(env, facts, opts):
          lambda: probe_caches(env, facts)),
         ("PF-08", "ArcGISPro", "Search index state", False,
          lambda: probe_index(env, facts)),
+        ("PF-09", "Network", "Layers served over the network", False,
+         lambda: probe_http_layers(env, facts)),
+        ("PF-10", "ArcGISPro", "Project weight", False,
+         lambda: probe_project_weight(env, facts)),
         ("PF-11", "Hardware", "Per-app GPU preference", False,
          lambda: probe_gpu_preference(env, facts)),
         ("PF-12", "Hardware", "Physical memory", False,
          lambda: probe_memory(env, facts)),
         ("PF-13", "Hardware", "Free disk space", False,
          lambda: probe_disk(env, facts)),
+        ("PF-14", "ArcGISPro", "Per-layer draw load", False,
+         lambda: probe_layer_load(env, facts)),
         ("PF-15", "System", "Active power plan", False,
          lambda: probe_power_plan(env, facts)),
+        ("PF-16", "ArcGISPro", "Raster overviews", False,
+         lambda: probe_overviews(env, facts)),
         ("PF-17", "Security", "Microsoft Defender exclusions", False,
          lambda: probe_defender(env, facts)),
+        ("PF-18", "Hardware", "Disk media type", False,
+         lambda: probe_disk_media(env, facts)),
         ("PF-19", "Network", "Portal reachability", False,
          lambda: probe_portal(env, facts, opts)),
+        ("PF-20", "System", "Pagefile size and location", False,
+         lambda: probe_pagefile(env, facts)),
+        ("PF-21", "Network", "Network adapter link speed", False,
+         lambda: probe_link_speed(env, facts)),
         ("PF-22", "ArcGISPro", "Layer refresh timers from the .aprx", False,
          lambda: probe_aprx(env, facts)),
         ("PF-26", "System", "Roaming profile", False,
@@ -3062,12 +4159,17 @@ def fix_cache_aside(env, checks, facts):
     moved = "%s.prostall-%s" % (path,
                                 time.strftime("%Y%m%d%H%M%S",
                                               time.gmtime(env.now())))
+    moved = unique_path(moved)
     env.rename(path, moved)
+    src, dst = quote_cmd(moved), quote_cmd(path)
+    undo = ('move %s %s' % (src, dst) if src and dst else
+            "the folder was moved to %s; move it back by hand, because that "
+            "path cannot be quoted safely on a command line" % moved)
     return {"id": "AP-01",
             "what": "Renamed the ESRI local cache folder aside. Pro rebuilds "
                     "it on the next launch.",
             "result": "%s -> %s" % (path, moved),
-            "undo": 'move "%s" "%s"' % (moved, path),
+            "undo": undo,
             "when": stamp(env.now())}
 
 
@@ -3078,11 +4180,19 @@ def fix_gpu_preference(env, checks, facts):
         return None
     previous = facts.get("gpu_previous")
     env.reg_write(GPU_PREFERENCE_KEY, exe, GPU_PREFERENCE_WANTED)
-    if previous:
-        undo = ('reg add "%s" /v "%s" /t REG_SZ /d "%s" /f'
-                % (GPU_PREFERENCE_KEY, exe, previous))
+    quoted_exe = quote_cmd(exe)
+    if quoted_exe and quote_cmd(previous or ""):
+        if previous:
+            undo = ('reg add "%s" /v %s /t REG_SZ /d %s /f'
+                    % (GPU_PREFERENCE_KEY, quoted_exe, quote_cmd(previous)))
+        else:
+            undo = 'reg delete "%s" /v %s /f' % (GPU_PREFERENCE_KEY,
+                                                 quoted_exe)
     else:
-        undo = 'reg delete "%s" /v "%s" /f' % (GPU_PREFERENCE_KEY, exe)
+        undo = ("the value named %s under %s was set to %s; undo it through "
+                "Settings > System > Display > Graphics, because that path "
+                "cannot be quoted safely on a command line"
+                % (exe, GPU_PREFERENCE_KEY, GPU_PREFERENCE_WANTED))
     return {"id": "AP-02",
             "what": "Pinned ArcGIS Pro to the high-performance graphics "
                     "adapter.",
@@ -3222,14 +4332,53 @@ def render_check(check, verbose=False):
     return lines
 
 
+def unique_path(path):
+    """A path that does not exist yet, so a write never overwrites a report.
+
+    The stamp is to the second. Two runs inside one second - a wrapper in a
+    loop, a diagnostic fired twice from one script - used to land on the same
+    name, and the second silently replaced the first. A report that vanished
+    between being written and being read is the same failure as a check that
+    reports something it never measured, only later.
+    """
+    root, ext = os.path.splitext(path)
+    counter = 1
+    while os.path.exists(path):
+        path = "%s_%d%s" % (root, counter, ext)
+        counter += 1
+    return path
+
+
+def quote_cmd(value):
+    """One argument quoted for a Windows command line, or None.
+
+    The undo commands this tool prints are meant to be pasted into cmd.exe.
+    None here means the value cannot be represented there safely, and the
+    caller then prints the manual route instead of a command that does
+    something other than what it appears to do.
+
+    A double quote is the case that matters: cmd strips one level of quoting
+    and the program's argument parser strips another, so an embedded quote
+    closes the argument early and the rest of the path becomes new arguments.
+    `&`, `|`, `<`, `>`, `^` and `%` are command separators and expansions
+    outside quotes, and `!` is one under delayed expansion. Refusing beats
+    guessing which parser the reader is using.
+    """
+    if value is None:
+        return None
+    if re.search(r"[\"&|<>^%!]", value):
+        return None
+    return '"%s"' % value
+
+
 def write_report(document, directory, verbose=False):
     """Write the text and JSON reports. Returns the two paths."""
     if not os.path.isdir(directory):
         os.makedirs(directory)
     base = "prostall_%s" % time.strftime("%Y%m%d_%H%M%S",
                                          time.gmtime(time.time()))
-    text_path = os.path.join(directory, base + ".txt")
-    json_path = os.path.join(directory, base + ".json")
+    text_path = unique_path(os.path.join(directory, base + ".txt"))
+    json_path = unique_path(os.path.join(directory, base + ".json"))
     handle = open(text_path, "wb")
     try:
         handle.write(("\n".join(render(document, verbose)) + "\n")
@@ -3352,8 +4501,14 @@ class FakeEnv(Env):
                     queue.append((_norm(path), level + 1))
         return entries, unreadable
 
-    def read_text(self, path):
-        return self._text.get(_norm(path))
+    def read_text(self, path, limit=MAX_TEXT_BYTES):
+        text = self._text.get(_norm(path))
+        if text is None:
+            return None, "absent on the stand-in machine"
+        if len(text) > limit:
+            return None, ("larger than the %s this tool will read into memory"
+                          % format_bytes(limit))
+        return text, None
 
     def rename(self, src, dst):
         key = _norm(src)
@@ -3392,6 +4547,17 @@ class FakeEnv(Env):
 
     def smb_client(self):
         return self._answer("smb")
+
+    def disk_media(self):
+        # Through the same conversion the real reader uses. A stand-in that
+        # handed back the raw PowerShell shape would answer differently from
+        # the machine, and the check would be testing the difference.
+        data, error = self._answer("disk_media")
+        return _ps_rows(data, "name", "media"), error
+
+    def link_speed(self):
+        data, error = self._answer("link_speed")
+        return _ps_rows(data, "name", "speed"), error
 
     def events(self, log, query, count):
         return self._events.get(log, (None, "no such log on the stand-in "
@@ -3465,6 +4631,62 @@ def aprx_texts(home, gdb, rate):
             ("Index/thumbnail.json", "not json at all")]
 
 
+def aprx_texts_heavy(home, gdb, rate):
+    """A project with the weight and the network draws a slow one has.
+
+    Everything the newer checks read is in here: a map coordinate system that
+    three layers disagree with, three layers served by URL, a group level, a
+    three-way join, a definition query and a label engine. It is a fixture,
+    not a transcription of a real project file.
+    """
+    def service(name):
+        return ("https://services.example.org/arcgis/rest/services/%s/"
+                "MapServer" % name)
+
+    def gdb_conn(dataset):
+        return {"workspaceConnectionString": r"DATABASE=..\g.gdb",
+                "dataset": dataset}
+
+    basemaps = [{"type": "CIMFeatureLayer", "name": name,
+                 "spatialReference": {"wkid": 3857},
+                 "serviceConnectionProperties": {"url": service(name)}}
+                for name in ("World_Imagery", "World_Topo", "World_Streets")]
+    return [
+        ("GISProject.json",
+         json.dumps({"type": "CIMGISProject", "defaultFolder": home,
+                     "defaultGeoDatabase": gdb})),
+        ("Map/map.json", json.dumps({
+            "type": "CIMMapDocument",
+            "map": {
+                "type": "CIMMap",
+                "name": "Map",
+                "spatialReference": {"wkid": 4326},
+                "generalPlacementProperties":
+                    {"type": "CIMMaplexLabelPlacementProperties"},
+                "layers": [
+                    {"type": "CIMGroupLayer", "name": "Basemaps",
+                     "layers": basemaps},
+                    {"type": "CIMFeatureLayer", "name": "Hydrants",
+                     "spatialReference": {"wkid": 4326},
+                     "refreshRate": rate,
+                     "refreshRateUnit": "esriTimeUnitsSeconds",
+                     "minScale": 50000,
+                     "labelClasses": [{"expression": "[NAME]"}],
+                     "featureTable": {
+                         "joins": [{"type": "CIMRelationshipJoin"},
+                                   {"type": "CIMRelationshipJoin"},
+                                   {"type": "CIMRelationshipJoin"}],
+                         "definitionExpression": "STATUS = 'Active'",
+                         "dataConnection": gdb_conn("Hydrants")}},
+                    {"type": "CIMFeatureLayer", "name": "Streets",
+                     "spatialReference": {"wkid": 4326},
+                     "refreshRate": 0,
+                     "definitionQuery": "CLASS = 1",
+                     "featureTable": {"dataConnection":
+                                          gdb_conn("Streets")}}]}})),
+        ("Index/thumbnail.json", "not json at all")]
+
+
 def fake_healthy():
     """A workstation with nothing wrong with it."""
     home = r"C:\Users\editor"
@@ -3487,6 +4709,8 @@ def fake_healthy():
                            "BuildNumber": "55405",
                            "InstallDir": r"C:\Program Files\ArcGIS\Pro"},
              r"HKLM\SOFTWARE\Policies\Microsoft\Windows\NetCache": {"Enabled": 0},
+             r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager"
+             r"\Memory Management": {"PagingFiles": ["C:\\pagefile.sys 16384 32768"]},
              r"HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps":
                  {"DumpFolder": r"C:\ProgramData\CrashDumps"},
              GPU_PREFERENCE_KEY:
@@ -3522,6 +4746,9 @@ def fake_healthy():
                           "ExclusionProcess": ["ArcGISPro.exe"]}, None),
             "nic": ([{"name": "Ethernet", "description": "Example 1GbE",
                       "state": "Disabled"}], None),
+            "disk_media": ([{"name": "SAMSUNG SSD 980 PRO", "media": "SSD"}],
+                           None),
+            "link_speed": ([{"name": "Ethernet", "speed": "1 Gbps"}], None),
             "smb": ({"EnableMultiChannel": True,
                      "RequireSecuritySignature": False,
                      "DirectoryCacheLifetime": 10,
@@ -3554,6 +4781,8 @@ def fake_sick():
              PRO_REG_KEY: {"Version": "3.4",
                            "InstallDir": r"C:\Program Files\ArcGIS\Pro"},
              r"HKLM\SOFTWARE\Policies\Microsoft\Windows\NetCache": {"Enabled": 1},
+             r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager"
+             r"\Memory Management": {"PagingFiles": ["Z:\\pagefile.sys 2048 4096"]},
              r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\S-1-5-21-1":
                  {"ProfileImagePath": "%USERPROFILE%",
                   "CentralProfile": r"\\server\profiles\editor"}},
@@ -3566,7 +4795,11 @@ def fake_sick():
               docs + r"\ArcGIS": [("Projects", 0, 0, 0, True)],
               projects: [("Addresses.aprx", 240000, 1, 0, False),
                          ("Addresses.gdb", 0,
-                          1, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, True)],
+                          1, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, True),
+                         # one raster with an overview beside it, one without
+                         ("ortho.tif", 900 * 1024 ** 2, 40, 0, False),
+                         ("dem.tif", 400 * 1024 ** 2, 40, 0, False),
+                         ("dem.ovr", 90 * 1024 ** 2, 40, 0, False)],
               cache: [("g%d.cache" % n, 4096, 700, 0, False) for n in range(14)],
               index: [("ResourceIndex", 0, 0, 0, True),
                       ("Connections", 0, 0, 0, True)],
@@ -3610,6 +4843,12 @@ def fake_sick():
                       "state": "Enabled"},
                      {"name": "Dock", "description": "Example USB dock",
                       "state": None}], None),
+            "disk_media": ([{"name": "SAMSUNG SSD 870", "media": "SSD"},
+                            {"name": "TOSHIBA MQ01ABD100", "media": "HDD"}],
+                           None),
+            "link_speed": ([{"name": "Wi-Fi", "speed": "866 Mbps"},
+                            {"name": "Ethernet 2", "speed": "100 Mbps"}],
+                           None),
             "smb": ({"EnableMultiChannel": False,
                      "RequireSecuritySignature": True,
                      "DirectoryCacheLifetime": 10,
@@ -3628,7 +4867,7 @@ def fake_sick():
                     ("Microsoft-Windows-SMBClient", 30999,
                      "2026-09-02T14:29:55", [r"\\files\gis"], 3)), None)},
         zips={projects + r"\Addresses.aprx":
-                  (aprx_texts(".", "Addresses.gdb", 30), False)})
+                  (aprx_texts_heavy(".", "Addresses.gdb", 30), False)})
 
 
 def fake_bare():
@@ -3740,6 +4979,22 @@ def self_test():
     check(make_check(**dict(good, status="Warn", autofixable=True,
                             fix="do this"))["autofixable"],
           "a fixable flag with a fix is accepted")
+    check("kpi" not in make_check(**good),
+          "a check that measured no number carries no kpi key at all, rather "
+          "than an empty one a gauge would draw as zero")
+    check(make_check(**dict(good, kpi={"free_gb": 12.5}))["kpi"]
+          == {"free_gb": 12.5},
+          "and one that did carries its numbers, which is what the report "
+          "draws a gauge from instead of parsing a sentence")
+    raises(lambda: make_check(**dict(good, kpi={"free_gb": "12 GB"})),
+           "a kpi that is a string is refused: a gauge drawn off text parsed "
+           "back out of a sentence is a number the report invented  "
+           "<-- pinned defect")
+    raises(lambda: make_check(**dict(good, kpi={"healthy": True})),
+           "and so is a boolean, which is an int in Python and would draw as "
+           "a gauge at 1  <-- pinned defect")
+    raises(lambda: make_check(**dict(good, kpi=["free_gb"])),
+           "and a kpi that is not a mapping")
     check(make_check(**dict(good, observed=["a", "b"]))["observed"] == "a\nb",
           "an observed list becomes one newline-joined string")
     check(make_check(**dict(good, detail=("x", "y")))["detail"] == "x\ny",
@@ -4282,6 +5537,165 @@ def self_test():
           "not escalated as data loss")
 
     # ----------------------------------------- the causes added in this release
+    # --------------------------------------- the documented performance causes
+    print("-" * 70)
+    print("the documented performance causes, on both sides of each branch")
+
+    heavy = scan_aprx(r"C:\P\a.aprx", aprx_texts_heavy(".", "a.gdb", 30), [])
+    light = scan_aprx(r"C:\P\a.aprx", aprx_texts(".", "a.gdb", 0), [])
+    check(len(heavy["layers"]) == 6 and heavy["depth"] == 1,
+          "the heavy fixture really carries six layers, three of them under a "
+          "group level, so the checks below are reading something")
+
+    check(decide_projection([heavy])["status"] == "Warn",
+          "three layers in 3857 under a map in 4326 warn: they are reprojected "
+          "on every draw and Pro does not say so")
+    check("3857" in _join(decide_projection([heavy])["observed"]),
+          "and the system that disagrees is named, not just counted")
+    agreed = scan_aprx(r"C:\P\a.aprx", aprx_texts_heavy(".", "a.gdb", 0), [])
+    for layer in agreed["layers"]:
+        layer["wkid"] = 4326
+    check(decide_projection([agreed])["status"] == "Pass",
+          "the same project with every layer in the map's system passes")
+    check(decide_projection([light])["status"] == "Info"
+          and decide_projection([light])["measured"] is False,
+          "a project that records no spatial reference is Info and unmeasured, "
+          "never a Pass: the file does not say, so nothing was compared  "
+          "<-- pinned defect")
+    check(decide_projection([])["status"] == "Info",
+          "and no project at all is Info")
+    check(decide_projection([dict(agreed, truncated=True)])["status"] == "Info",
+          "and a project read only in part cannot pass a comparison it did "
+          "not finish: the mismatch could be in the part that was never read")
+    check(decide_projection([dict(heavy, truncated=True)])["status"] == "Warn",
+          "while a mismatch that WAS found stays a finding, because the "
+          "layers it named were named")
+
+    check(decide_http_layers([heavy])["status"] == "Warn",
+          "three layers served by URL warn: those draw over the network on "
+          "every pan")
+    check("World_Imagery" in _join(decide_http_layers([heavy])["observed"]),
+          "and the layers are named, so the editor can recognise them")
+    check(decide_http_layers([light])["status"] == "Pass",
+          "a project with no URL layers passes")
+    one_http = [dict(light, layers=[dict(light["layers"][0],
+                                        uri="https://x.example.org/a")])]
+    check(decide_http_layers(one_http)["status"] == "Info",
+          "one service layer is reported and not warned: it is a choice, not "
+          "a fault")
+    check(decide_http_layers([dict(heavy, truncated=True)])["status"] == "Warn",
+          "and a finding already made survives a partial read, because the "
+          "layers it found were found")
+    check(is_http_uri("HTTPS://X/A") and not is_http_uri(r"\\server\share\g.gdb")
+          and not is_http_uri("DATABASE=..\\g.gdb"),
+          "a URL is classified by its scheme, and a UNC path and a geodatabase "
+          "connection are not URLs")
+
+    weighed = decide_project_weight(
+        [heavy], [(r"C:\P\a.aprx", 30 * 1024 ** 2)])
+    check(weighed["status"] == "Warn",
+          "a thirty megabyte project file warns: that is minutes of open, and "
+          "it is not a workstation fault")
+    check(decide_project_weight([light], [(r"C:\P\a.aprx", 240000)])["status"]
+          == "Pass",
+          "and a small project with few layers passes")
+    many = [dict(light, layers=[{"name": "l%d" % n} for n in range(LAYERS_MANY)])]
+    check(decide_project_weight(many, [])["status"] == "Warn",
+          "%d layers warn on their own count" % LAYERS_MANY)
+    check(decide_project_weight([], [(r"C:\P\a.aprx", 1)])["status"] == "Info"
+          and decide_project_weight([], [])["measured"] is False,
+          "sizes with no project document are Info and unmeasured: a file size "
+          "is not a project weight  <-- pinned defect")
+
+    check(decide_layer_load([heavy])["status"] == "Warn",
+          "a three-way join warns: it is re-evaluated on every draw")
+    check("Maplex" in _join(decide_layer_load([heavy])["observed"]),
+          "and the label engine is reported, because Maplex places better and "
+          "costs more")
+    check(decide_layer_load([light])["status"] == "Info",
+          "a project with no joins and no recorded engine is Info, not Pass: "
+          "the engine was not recorded, so nothing was compared")
+    check(decide_layer_load([dict(heavy, layers=[])])["status"] == "Info",
+          "and a project whose documents were read but hold no layers is Info")
+
+    check(decide_overviews([r"C:\P\ortho.tif", r"C:\P\dem.tif"],
+                           set([r"C:\P\dem.tif"]), [])["status"] == "Warn",
+          "a raster with no overview beside it warns: it is read at full "
+          "resolution on every draw")
+    check(decide_overviews([r"C:\P\dem.tif"], set([r"C:\P\dem.tif"]),
+                           [])["status"] == "Pass",
+          "and one with its sidecar passes")
+    unread = decide_overviews([], set(), [r"\\files\gis: access denied"])
+    check(unread["status"] == "Info" and unread["measured"] is False,
+          "a project folder nobody could read is Info and unmeasured, not a "
+          "clean scan: a walk that returns nothing for a folder it could not "
+          "open says the tree is fine when it has no idea  <-- pinned defect")
+    check(decide_overviews([], set(), [])["status"] == "Info",
+          "and no raster at all is Info, because there was nothing to build "
+          "overviews for")
+
+    check(decide_disk_media([("SSD 980", "SSD"), ("TOSHIBA", "HDD")],
+                            None)["status"] == "Warn",
+          "one rotational disk among solid-state ones warns: no setting fixes "
+          "it, and it reads as a mystery because every software setting is "
+          "correct")
+    check(decide_disk_media([("SSD 980", "SSD")], None)["status"] == "Pass",
+          "and an all-flash machine passes")
+    check(decide_disk_media([("RAID volume", "Unspecified")], None)["status"]
+          == "Warn",
+          "Unspecified is reported as a disk that may be rotational, because a "
+          "controller that will not say is not an answer that it is fast")
+    check(decide_disk_media([], "access denied")["status"] == "Info"
+          and decide_disk_media([], "access denied")["measured"] is False,
+          "and an unread disk list is Info and unmeasured, never a Pass  "
+          "<-- pinned defect")
+
+    check(decide_pagefile([r"\\server\pagefile.sys 4096 8192"], None)["status"]
+          == "Fail",
+          "a pagefile on a network volume fails: it is a multi-second stall "
+          "that appears in no Pro log")
+    check(decide_pagefile(["C:\\pagefile.sys 1024 2048"], None)["status"]
+          == "Warn",
+          "a pagefile under %d MB warns" % PAGEFILE_MIN_MB)
+    check(decide_pagefile(["C:\\pagefile.sys 16384 32768"], None)["status"]
+          == "Pass",
+          "and a sized pagefile on a local disk passes")
+    check(decide_pagefile([], None)["status"] == "Info",
+          "system managed is Info, not Pass: Windows decides the size at boot "
+          "and this tool cannot read the number it chose")
+    check(decide_pagefile([], "no value")["status"] == "Info"
+          and decide_pagefile([], "no value")["measured"] is False,
+          "and an unread setting is unmeasured, not system managed  "
+          "<-- pinned defect")
+    check(_pagefile_mb("C:\\pagefile.sys 4096 8192") == 4096
+          and _pagefile_mb("C:\\pagefile.sys") is None,
+          "the initial size is read out of the entry, and an entry without one "
+          "answers nothing rather than zero")
+
+    check(decide_link_speed([("Ethernet", "1 Gbps"), ("Dock", "100 Mbps")],
+                            None)["status"] == "Warn",
+          "a gigabit adapter beside one linked at a hundred megabit warns: it "
+          "presents as a slow server and nothing in the SMB settings explains "
+          "it")
+    check(decide_link_speed([("Ethernet", "1 Gbps")], None)["status"] == "Pass",
+          "and a single gigabit link passes")
+    check(_mbps("1 Gbps") == 1000.0 and _mbps("100 Mbps") == 100.0
+          and _mbps("Unrecognized") is None,
+          "the link speed is parsed into megabits, and a string this tool does "
+          "not recognise answers nothing rather than a number")
+    unknown_link = decide_link_speed([("Ethernet", "Unrecognized")], None)
+    check(unknown_link["status"] == "Info" and unknown_link["measured"] is False,
+          "a link speed nobody could read is Info and unmeasured, not a "
+          "Pass  <-- pinned defect")
+    check(decide_link_speed([], "access denied")["status"] == "Info",
+          "and an unread adapter list is Info")
+
+    check(_ps_rows({"name": "one", "media": "SSD"}, "name", "media")
+          == [("one", "SSD")],
+          "a single PowerShell row is unwrapped: ConvertTo-Json drops the "
+          "array wrapper for one object, and a machine with exactly one disk "
+          "would otherwise read as a machine with none  <-- pinned defect")
+
     print("-" * 70)
     print("network power, the event timeline, SMB, share latency, Defender "
           "and the .aprx")
@@ -4653,6 +6067,11 @@ def self_test():
         "PF-26": "Warn", "PF-27": "Info",
         "DL-04": "Warn", "DL-13": "Warn", "PF-02": "Info", "PF-03": "Info",
         "PF-17": "Warn", "PF-22": "Info",
+        # The four that read the project file are Info here and not Warn,
+        # because DL-12 found Pro running and the read is refused. That is the
+        # refusal working, and it is pinned rather than assumed.
+        "PF-01": "Info", "PF-09": "Info", "PF-10": "Info", "PF-14": "Info",
+        "PF-16": "Warn", "PF-18": "Warn", "PF-20": "Warn", "PF-21": "Warn",
     }
     for cid in sorted(expected_run):
         check(got.get(cid) == expected_run[cid],
@@ -5038,7 +6457,7 @@ def self_test():
             reloaded = json.loads(handle.read())
         finally:
             handle.close()
-        check(reloaded["prostall"] == 1,
+        check(reloaded["prostall"] == REPORT_VERSION,
               "the JSON report carries its format version, so a diff against "
               "an older report from another workstation fails loudly")
         check(reloaded["act_first"] == document["act_first"],
@@ -5213,10 +6632,27 @@ def self_test():
         check(missing == [] and missing_bad == [],
               "scanning a directory that is not there is empty, not an error")
 
-        check(live.read_text(os.path.join(root, "a.txt")) == "hello",
-              "a file is read")
-        check(live.read_text(os.path.join(root, "nope")) is None,
-              "and a missing one reads as None rather than raising")
+        check(live.read_text(os.path.join(root, "a.txt")) == ("hello", None),
+              "a file is read, and a successful read says so in the second "
+              "slot rather than leaving the caller to guess")
+        check(live.read_text(os.path.join(root, "nope"))[0] is None
+              and live.read_text(os.path.join(root, "nope"))[1],
+              "and a missing one reads as None with a reason rather than "
+              "raising")
+        huge = os.path.join(root, "huge.config")
+        handle = io.open(huge, "w", encoding="utf-8")
+        try:
+            handle.write("x" * 2048)
+        finally:
+            handle.close()
+        text, reason = live.read_text(huge, limit=1024)
+        check(text is None and "larger than" in (reason or ""),
+              "a file over the limit is refused with a reason, not read: a "
+              "synced user.config is a file this tool did not write  "
+              "<-- pinned defect")
+        check(live.read_text(huge, limit=4096) == ("x" * 2048, None),
+              "and the same file reads whole once the limit allows it, so the "
+              "refusal is about the limit and not about the file")
 
         live.rename(sub, sub + "-aside")
         check(live.isdir(sub + "-aside") and not live.isdir(sub),
@@ -5319,6 +6755,7 @@ def self_test():
           "read, and a reason where it cannot")
 
     zroot = tempfile.mkdtemp(prefix="prostall-zip-")
+    froot = None
     try:
         import zipfile
         good_zip = os.path.join(zroot, "Roads.aprx")
@@ -5348,6 +6785,54 @@ def self_test():
         check(live.read_zip_json(not_zip)[2],
               "a project file that is not a zip is a reason, not an empty "
               "project")
+
+        # A lying header. The uncompressed size in a zip's central directory
+        # is a number the file's author chose, and the reader stops there, so
+        # a cap that trusts it both understates itself and turns a corrupt
+        # entry into an exception that escapes the reader. These get a folder
+        # of their own: the listing test below counts the entries of zroot,
+        # and a diagnostic's own test fixtures are not part of the folder it
+        # is timing.
+        import struct
+        froot = tempfile.mkdtemp(prefix="prostall-forged-")
+        lying = os.path.join(froot, "lying.aprx")
+        payload = b"A" * (4 * 1024 * 1024)
+        with zipfile.ZipFile(lying, "w", zipfile.ZIP_DEFLATED) as zarch:
+            zarch.writestr("project/project.json", payload)
+        blob = bytearray(io.open(lying, "rb").read())
+        eocd = blob.rfind(b"PK\x05\x06")
+        central = struct.unpack_from("<I", blob, eocd + 16)[0]
+        declared = struct.unpack_from("<I", blob, central + 24)[0]
+        check(declared == len(payload),
+              "the forged archive really does declare the full four megabytes "
+              "before the test lies about it")
+        struct.pack_into("<I", blob, central + 24, 100)
+        handle = io.open(lying, "wb")
+        try:
+            handle.write(bytes(blob))
+        finally:
+            handle.close()
+        texts, capped, reason = live.read_zip_json(lying, max_total=65536)
+        check(texts == [] and reason and "project.json" in reason,
+              "a header that understates the entry is caught by reading to the "
+              "end and letting the archive's own checksum speak, not by "
+              "trusting the number in the header  <-- pinned defect")
+        check("Bad CRC" in (reason or "") or "CRC" in (reason or ""),
+              "and the reason says which entry failed and why, so a corrupt "
+              "project is named rather than read as an empty one")
+
+        honest = os.path.join(froot, "honest.aprx")
+        with zipfile.ZipFile(honest, "w", zipfile.ZIP_DEFLATED) as zarch:
+            zarch.writestr("a.json", '{"defaultFolder": "."}')
+            zarch.writestr("b.json", "x" * 600)
+        texts, capped, reason = live.read_zip_json(honest, max_entry=100)
+        check([n for n, _t in texts] == ["a.json"] and capped is True,
+              "one entry over the cap costs that entry and no other: a "
+              "project with three readable documents and one oversized one "
+              "still answers for the three  <-- pinned defect")
+        texts, capped, reason = live.read_zip_json(honest)
+        check(len(texts) == 2 and reason is None,
+              "and with the cap where it belongs the same file reads whole")
         for n in range(3):
             io.open(os.path.join(zroot, "f%d.txt" % n), "w").close()
         elapsed, entries, reason = live.time_listdir(zroot)
@@ -5360,6 +6845,125 @@ def self_test():
               "a folder that cannot be listed has no time, only a reason")
     finally:
         shutil.rmtree(zroot, ignore_errors=True)
+        if froot:
+            shutil.rmtree(froot, ignore_errors=True)
+
+    # ---------------------------------------------------- the hardened reads
+    print("-" * 70)
+    print("the reads are hardened against a file this tool did not write")
+
+    bomb = ('<?xml version="1.0"?>\n<!DOCTYPE r [\n'
+            ' <!ENTITY a "xxxxxxxxxx">\n <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;'
+            '&a;&a;">\n <!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">\n'
+            ' <!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">\n'
+            ' <!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">\n'
+            ' <!ENTITY f "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">\n]>\n'
+            '<configuration><section><setting name="k"><value>&f;</value>'
+            '</setting></section></configuration>')
+    check(len(bomb) < 700, "the entity bomb really is a few hundred bytes")
+    check(parse_user_config(bomb) == {},
+          "a user.config carrying a document type declaration is refused "
+          "outright: expat expands internal entities, so those few hundred "
+          "bytes are a million characters by the time the parser is done  "
+          "<-- pinned defect")
+    check(len(parse_user_config(
+        '<configuration><setting name="a"><value>1</value></setting>'
+        '</configuration>')) == 1,
+          "and a real user.config, which has no document type declaration, "
+          "still parses")
+    check(parse_user_config('<!doctype configuration><setting name="a"/>'
+                            '</configuration>') == {},
+          "the refusal does not care how the declaration is spelled")
+
+    deep = "[" * 5000 + "]" * 5000
+    try:
+        found = scan_aprx(r"C:\P\a.aprx", [("x.json", deep)], [])
+        check(found["capped"] is True,
+              "a project document nested five thousand deep is declined with "
+              "a cap, not with a RecursionError that took the whole check "
+              "down with it  <-- pinned defect")
+    except RecursionError:
+        check(False, "a deeply nested project must not end the check with a "
+                     "RecursionError")
+    nested = scan_aprx(r"C:\P\a.aprx",
+                       [("x.json", json.dumps({"a": {"refreshRate": 30}}))], [])
+    check(len(nested["refresh"]) == 1,
+          "and an ordinary project still yields its timers after the walk was "
+          "made iterative")
+
+    probe_dir = tempfile.mkdtemp(prefix="prostall-uniq-")
+    try:
+        target = os.path.join(probe_dir, "prostall_20260101_000000.txt")
+        check(unique_path(target) == target,
+              "a name nobody has taken is left alone")
+        handle = io.open(target, "w")
+        handle.close()
+        second = unique_path(target)
+        check(second != target and not os.path.exists(second),
+              "and a name that is taken gets another one: two runs inside one "
+              "second used to land on the same file and the second silently "
+              "replaced the first  <-- pinned defect")
+        handle = io.open(second, "w")
+        handle.close()
+        check(unique_path(target) not in (target, second),
+              "and it keeps going until it finds one that is free")
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+    check(quote_cmd(r"C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe")
+          == r'"C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe"',
+          "a path with spaces in it is quoted for the undo command")
+    check(quote_cmd('C:\\bin"ArcGISPro.exe') is None,
+          "and a path holding a double quote is refused rather than printed: "
+          "cmd strips one level of quoting and the program's parser strips "
+          "another, so the command would do something other than what it "
+          "says  <-- pinned defect")
+    for hostile in ("a&b", "a|b", "a<b", "a>b", "a^b", "a%PATH%b", "a!b!"):
+        if quote_cmd(hostile) is not None:
+            check(False, "%r must not be quoted for a command line" % hostile)
+            break
+    else:
+        check(True,
+              "a command separator or a percent expansion is refused too, "
+              "because outside quotes those are live in cmd.exe")
+
+    ghost = FakeEnv(envvars={})
+    check(ghost.system32("tasklist") == "tasklist",
+          "with no SystemRoot the program name is passed through unchanged, "
+          "rather than built into a path that cannot exist")
+    rooted = FakeEnv(envvars={"SystemRoot": r"C:\Windows"},
+                     tree={r"C:\Windows\System32": [("wevtutil.exe", 1000, 0,
+                                                     0, False)]})
+    check(rooted.system32("wevtutil.exe")
+          == r"C:\Windows\System32\wevtutil.exe",
+          "and with one, a program that ships with Windows is started by its "
+          "full path: Windows searches the current directory first for a bare "
+          "name, so a bare name run from somebody else's folder can run "
+          "their file  <-- pinned defect")
+    check(rooted.system32("prostall-not-here.exe") == "prostall-not-here.exe",
+          "while a name that is not there is left as it was")
+
+    live_tcp = Env()
+    real_getaddrinfo = socket.getaddrinfo
+
+    def slow_name(*args, **kwargs):
+        time.sleep(2)
+        return real_getaddrinfo(*args, **kwargs)
+
+    socket.getaddrinfo = slow_name
+    try:
+        started = time.time()
+        addresses, reason = live_tcp.resolve("slow.example.invalid", 1433, 100)
+        took_ms = int((time.time() - started) * 1000)
+        check(addresses is None and "did not answer" in (reason or ""),
+              "a name lookup that does not answer is its own answer, inside "
+              "the bound: it is not 'the name did not resolve', which would "
+              "say the host does not exist  <-- pinned defect")
+        check(took_ms < 1500,
+              "and it gave up in %d ms rather than waiting out the system "
+              "resolver's retry budget" % took_ms)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
 
     # --------------------------------------------- the whole tool, on this box
     print("-" * 70)
@@ -5369,8 +6973,8 @@ def self_test():
           "a real run exits 0, 1, 2 or 3, whatever this machine turns out to "
           "be")
     live_document = json.loads(printed)
-    check(live_document["prostall"] == 1,
-          "the JSON it prints carries report version 1, the number a diff "
+    check(live_document["prostall"] == 2,
+          "the JSON it prints carries report version 2, the number a diff "
           "against a known-good workstation is taken at: comparing it to the "
           "constant that defines it would hold for any value")
     check(len(live_document["checks"]) == len(expected_run),
@@ -5837,7 +7441,7 @@ def self_test():
     jr_dir = tempfile.mkdtemp(prefix="prostall-json-report-")
     try:
         code, out, err = with_env(fake_healthy, ["--json", "--report", jr_dir])
-        check(json.loads(out)["prostall"] == 1,
+        check(json.loads(out)["prostall"] == 2,
               "--json with --report prints one JSON document on stdout  "
               "<-- pinned defect")
         check("report :" in err and "report :" not in out,
@@ -5851,7 +7455,7 @@ def self_test():
 
     code, out, err = with_env(OffMachine, ["--json"])
     check("almost every probe" in err and "almost every probe" not in out
-          and json.loads(out)["prostall"] == 1,
+          and json.loads(out)["prostall"] == 2,
           "off Windows the note goes to stderr and stdout stays a document")
 
     # The reading layer, reached with stand-ins instead of left unreached.
@@ -6209,6 +7813,12 @@ def main(argv=None):
             return USAGE_ERROR
 
     make_output_safe(sys.stdout)
+    # stderr too. The three lines that go there name a path, and a path on a
+    # redirected cp1252 console can hold a character that code page has no
+    # glyph for. One stream reconfigured and not the other turned "could not
+    # write the report" into a UnicodeEncodeError traceback, so the run exited
+    # on an encoding error instead of with the 64 that says why.
+    make_output_safe(sys.stderr)
 
     env = Env()
     if not env.windows:

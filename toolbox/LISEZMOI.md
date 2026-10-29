@@ -51,7 +51,7 @@ enchaîné dans un modèle ModelBuilder.
 ### 2. Verify prostall (offline self-test)
 
 Lance les assertions internes de prostall sur des postes de travail de
-substitution (les 629 assertions). Ne lit aucun registre, n'écrit rien, ne
+substitution (les 708 assertions). Ne lit aucun registre, n'écrit rien, ne
 contacte aucun hôte. À lancer avant de faire confiance à un rapport sur une
 nouvelle machine.
 
@@ -79,23 +79,59 @@ reste décoché.
 
 ## Le rapport HTML
 
-Une seule page, autonome :
+Une seule page, autonome, en français :
 
-- **Bannière** en tête : soit les trouvailles à traiter en premier, soit la
-  raison pour laquelle il n'y en a pas — y compris « rien n'a pu être déterminé »
-  (code de sortie 3), qui n'est pas une machine saine.
-- **Bandeau de comptage** : FAIL / WARN / PASS / INFO / SKIPPED, le pire d'abord.
-- **Filtres** : tout, trouvailles seulement, perte de données, performance, ou
-  un statut précis ; plus une recherche plein texte. JavaScript local, sans
-  réseau, et tout reste visible si JavaScript est désactivé.
-- **Chaque contrôle** : id, statut coloré, titre, catégorie, la valeur observée,
-  puis impact et correctif ; le détail, la valeur attendue et le correctif
-  manuel sont repliés.
-- **Les portes des correctifs** et les correctifs appliqués, chacun avec sa
-  **commande d'annulation**.
-- **Le document JSON** complet, embarqué, pour diff contre un poste rapide connu.
-- Un en-tête `Content-Security-Policy` qui n'autorise aucune source externe, un
-  mode sombre et une feuille de style d'impression.
+### Sommaire
+
+Une barre qui reste en haut de page et mène à chaque section, avec le nombre de
+contrôles de chaque bloc. Le lien « Perte de données » passe en rouge quand il
+contient quelque chose.
+
+### KPI
+
+Sept cartes : **santé globale** (0–100), anomalies, avertissements, trouvailles
+de perte de données, contrôles conformes, non déterminés, et **couverture de
+mesure**.
+
+Le score coûte 12 points par anomalie et 6 par avertissement — 18 et 9 quand la
+trouvaille porte sur des modifications perdues. **Un lancement qui n'a rien pu
+mesurer n'a pas de score du tout** : la jauge affiche `n/d`. Un cadran vert sur
+un poste illisible serait exactement le défaut que prostall existe pour
+empêcher, déplacé en aval.
+
+### Jauges
+
+Cadres SVG inline : santé globale, couverture de mesure, mémoire libre, disque
+libre du pire volume, latence du partage, liaison réseau négociée, taille du
+cache ESRI.
+
+**Chaque nombre vient d'un `kpi` que le contrôle a porté**, jamais d'une phrase
+relue. Un contrôle qui n'a pas rendu de nombre ne dessine pas de jauge : la page
+afficherait sinon un chiffre inventé par le moteur de rendu. `make_check` refuse
+un `kpi` qui n'est pas un dictionnaire de nombres — une chaîne ou un booléen est
+refusé.
+
+### Drapeaux
+
+Une ligne par symptôme S1 à S5, qui compte les contrôles en anomalie dont la
+ligne d'impact nomme ce symptôme, avec un lien vers chacun. Les cinq lignes sont
+toujours là, y compris à zéro : un zéro doit être visible, pas absent. Rien n'est
+déduit — un contrôle dont l'impact ne nomme aucun symptôme n'en drape aucun.
+
+### Chaque contrôle
+
+Une carte avec : le badge de statut, le marqueur « perte de données », le
+**problème détecté**, l'**impact**, et la **correction / optimisation** juste à
+côté. La valeur attendue, la preuve et le correctif manuel sont repliés. Les
+nombres mesurés apparaissent en pastilles, pour vérifier la jauge contre la
+mesure.
+
+### Le reste
+
+Les portes des correctifs, la commande d'annulation de tout ce qui a été
+appliqué, la légende des cinq statuts, et le document JSON embarqué pour le
+diff. Un en-tête `Content-Security-Policy` n'autorise aucune source externe ;
+mode sombre et feuille de style d'impression inclus.
 
 ### Sécurité du rendu
 
@@ -114,8 +150,8 @@ payload.
 ## Vérifier
 
 ```
-python tests/test_toolbox.py      # 54 assertions sur le rendu et la toolbox
-python prostall.py --self-test    # 629 assertions sur le diagnostic
+python tests/test_toolbox.py      # 77 assertions sur le rendu et la toolbox
+python prostall.py --self-test    # 708 assertions sur le diagnostic
 ```
 
 `tests/test_toolbox.py` n'a besoin que de la bibliothèque standard : il exécute
