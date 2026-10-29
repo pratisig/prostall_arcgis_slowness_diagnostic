@@ -220,7 +220,7 @@ exercises the reading layer itself against a real temporary directory and a real
 and runs the whole tool once, read-only, on the machine you run it on. That run is captured, not
 printed.
 
-The same 629 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
+The same 708 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
 labels. That matters more than it sounds: the path logic answers questions about Windows paths,
 and two of the bugs it pins are cases where the standard library answers for the host instead of
 for the path. The reads that only exist on Windows are run twice, once with the platform switched
@@ -291,7 +291,7 @@ credential.
 
 ## What it checks
 
-Twenty-eight checks. The thirteen that bear on lost edits run first and print first, because
+Thirty-six checks. The thirteen that bear on lost edits run first and print first, because
 silent edit loss outranks every performance finding.
 
 **Data loss**, in the order they run and print.
@@ -316,21 +316,33 @@ silent edit loss outranks every performance finding.
 
 | Id | What it measures |
 |---|---|
+| PF-01 | The coordinate systems in the project, and whether the layers agree with the map. A layer in a different system is reprojected on every draw and Pro does not say so. |
 | PF-02 | The SMB client settings, with multichannel graded only when a recent project is on a share. |
 | PF-03 | How long one listing takes in each of the first two share folders that hold a recent project. The report says how many further folders were not timed. One folder that cannot be listed makes it `Info`. |
 | PF-04 | The installed release and build. |
-| PF-05 | The display settings, read only. |
+| PF-05 | The display settings, read only. A `user.config` nobody could read is `Info`, not a list of `<absent>`. |
 | PF-06 | The local cache: size, and how much of it is orphaned. |
 | PF-08 | The catalog search index, and whether it indexes network connections. |
+| PF-09 | How many layers draw their rows over the network by URL, named. These draw on every pan and zoom, and off the VPN they are the whole of the stall. |
+| PF-10 | The weight of the project: layer count, group nesting and project-file size. Not a fault, but the answer that stops the rest of the report reading as the whole story. |
 | PF-11 | Which graphics adapter Windows hands Pro. |
 | PF-12 | Installed and free memory. |
 | PF-13 | Free space on the system volume and on any local project volume. |
+| PF-14 | The per-layer work a draw does: joins, definition queries, labelled layers, visibility ranges, and which label engine the map uses. |
 | PF-15 | The active power plan. |
+| PF-16 | Rasters under the project folder with no overview beside them. A raster with no pyramid is read at full resolution and thinned on screen, every draw. |
 | PF-17 | Whether Microsoft Defender excludes the Pro install folder, the editor's ESRI folders and `ArcGISPro.exe`. |
+| PF-18 | What the physical disks are made of. `Unspecified` is graded as possibly rotational, because a controller that will not say is not an answer that the disk is fast. |
 | PF-19 | A bounded TCP connect to the portal. A name that does not resolve is `Info`, like DL-10. |
+| PF-20 | The pagefile, from the boot-time registry value. One on a network volume is `Fail`: a multi-second stall that appears in no Pro log. |
+| PF-21 | What each adapter actually negotiated. A gigabit adapter linked at a hundred megabit presents as a slow server, and nothing in the SMB settings explains it. |
 | PF-22 | Layer refresh timers and the default geodatabase, read from inside the three newest recent `.aprx` files, only while DL-12 shows Pro closed. The report says how many older ones were not read. |
 | PF-26 | Whether a roaming profile carries the ESRI settings folder. |
 | PF-27 | Symbology that does not refresh after a field calculation. |
+
+PF-01, PF-09, PF-10, PF-14 and PF-22 all read the project file, and they share **one** read. Each
+read holds the file open, and doing it five times would be five chances to contend with a save -
+which is the failure this tool refuses to cause. All five are refused together while Pro runs.
 
 PF-07 keeps its performance id and runs in the data-loss block on purpose. An earlier version
 reported those folders as a count and a size and called it disk churn, which routed a possible
@@ -476,6 +488,83 @@ different time zones would otherwise disagree on every dated line.
 A check-only run still evaluates the fix gates and prints what it would have done. `applied` is
 empty unless `--apply` was given, and the self-test asserts that across a whole run.
 
+## ArcGIS Pro toolbox, and the HTML report
+
+[`toolbox/`](toolbox/LISEZMOI.md) wraps this same diagnostic as an ArcGIS Pro Python Toolbox, and
+renders the result as one self-contained HTML file. `prostall.py` itself stays a single file with no
+`arcpy` import; the toolbox and the renderer sit beside it.
+
+| File | What it is |
+|---|---|
+| `toolbox/ProstallDiagnostic.pyt` | Two tools: the diagnostic, and the offline self-test |
+| `toolbox/html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
+| `tests/test_toolbox.py` | 54 assertions over both, on a stand-in `arcpy` |
+
+Install by copying `prostall.py` next to the two toolbox files, then Catalog pane > Toolboxes > Add
+Toolbox, pointing at `ProstallDiagnostic.pyt`.
+
+The HTML is one page with no external asset at all, so it opens on a workstation that is offline:
+
+- a **sommaire** that stays at the top and links to every section, with the count of checks in each
+  block and the data-loss link marked when there is something in it;
+- **KPI cards**: health score, anomalies, warnings, data-loss findings, conforming checks,
+  undetermined ones, and measurement coverage;
+- **gauges** in inline SVG for the health score, the coverage, free memory, free disk on the worst
+  volume, share latency, negotiated link speed and cache size;
+- **flags**, one row per symptom S1-S5, counting the findings whose impact line names that symptom
+  and linking to each of them;
+- every check as a card: status badge, data-loss marker, the detected problem, the impact, and the
+  correction or optimisation beside it, with the expected value and the evidence folded away;
+- the fix gates, the undo command of anything applied, a legend, and the JSON document embedded for
+  the diff.
+
+A `Content-Security-Policy` header allows no external source.
+
+**Every number on the page comes from a `kpi` mapping the check carried.** Report format 2 adds that
+mapping to the checks that measure a number, and `make_check` refuses one that is not a mapping of
+numbers - a string or a boolean is refused. A gauge whose value had been parsed back out of a
+sentence would be a number the renderer invented on the way to the page, which is the defect this
+tool exists to prevent, moved downstream. A check that carries no number draws no gauge.
+
+The report is full of strings the machine supplied, not the operator: account names, paths off a
+file server, adapter descriptions, Defender exclusion paths, event text. Every one is escaped, and
+the embedded JSON encodes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`, so a folder name on a
+share cannot become markup in the operator's browser and cannot close the script element early. The
+JSON still decodes to the identical document. `tests/test_toolbox.py` asserts all of it against a
+document whose every field is a payload.
+
+**Running it from inside ArcGIS Pro means ArcGIS Pro is open.** DL-12 reports Pro as running and
+lands in the act-first list, PF-22 is refused because a project file must not be held open while Pro
+may be saving it, and AP-01 is refused for the same reason. A run from the Geoprocessing pane is a
+workstation report minus the project-file checks. For the full set, close Pro and run
+`prostall.py` in the editor's own session. The page says which of the two it was.
+
+```
+python tests/test_toolbox.py      # 54 assertions over the renderer and the toolbox
+python prostall.py --self-test    # 708 assertions over the diagnostic
+```
+
+The toolbox test executes the `.pyt` itself against a stand-in `arcpy`, so what runs there is the
+toolbox's own `getParameterInfo`, `updateMessages` and `execute`, through to the three files it
+writes. Not a copy of them.
+
+## Hardened reads
+
+Every file this tool opens is one it did not write, and some of them live in a folder a sync client
+may have replaced. Each of these was a real finding, and each is pinned by an assertion:
+
+| Read | What it was | What it is now |
+|---|---|---|
+| `user.config` | Read whole, with no bound. A 200 MB file came back as 209,715,203 characters. | 2 MB ceiling, and a document type declaration is refused outright, because expat expands internal entities and a few hundred bytes of nested declarations is a million characters by the time the parser finishes. |
+| `user.config` parse failure | A file nobody could read printed every setting as `<absent>`, which is a real answer. | A failed read is its own answer. DL-03, PF-05 and PF-08 say the settings are unknown and carry no verdict. |
+| `.aprx` entries | Bounded by the size the zip header claimed, and a corrupt entry raised out of the reader. | Bounded by the bytes actually decompressed, reading to the end so the archive's own checksum runs. One bad entry costs that entry; the survivors still answer. |
+| `.aprx` walk | Recursive. A document nested a thousand deep ended the whole check with a `RecursionError`, and one odd project became "no project was read". | An explicit stack, bounded on depth and node count, with the cap reported as a partial read. |
+| Report filenames | Stamped to the second, so two runs inside one second landed on the same file and the second silently replaced the first. | A name that does not exist yet. |
+| Undo commands | The executable path was interpolated between quotes, so a `"` in `InstallDir` closed the argument early. | Quoted through one helper that refuses a value holding a quote, `&`, `|`, `<`, `>`, `^`, `%` or `!`, and prints the manual route instead. |
+| Child programs | Started by bare name, and Windows searches the current directory first. | Started from `%SystemRoot%\System32` when that path exists. |
+| Name resolution | Unbounded, so a resolver that dropped the query held the run for the system's full retry budget. | A bounded wait. An unanswered lookup is its own answer, distinct from a name that does not resolve. |
+| `stderr` | Not reconfigured, so a non-cp1252 path in "could not write the report" raised a `UnicodeEncodeError` instead of exiting 64. | Reconfigured like `stdout`. |
+
 ## Limits
 
 - It reads a workstation. It does not read a server. Nothing here opens a geodatabase, runs a
@@ -532,9 +621,13 @@ empty unless `--apply` was given, and the self-test asserts that across a whole 
   such entry beside readable ones can still pass.
 - One malformed project makes PF-22 `Skipped` for all projects. A `defaultFolder` that is not a
   string, or a document nested thousands of levels deep, is enough.
-- The 32 MB project cap trusts the sizes in the zip header. A project that understates its size, or
-  an entry that is encrypted or uses an unsupported compression, can use more memory than the cap
-  or leave PF-22 `Skipped`.
+- The 32 MB project cap is enforced on the bytes actually decompressed, not on the size the zip
+  header claims. A header that understates its entry is caught by the archive's own checksum and the
+  entry is reported as unreadable; one that would take the total past the cap is left out and the
+  read is reported as capped. An encrypted entry, or one using a compression Python does not
+  implement, is reported the same way. An earlier revision of this page claimed a lying header could
+  use more memory than the cap. It could not: `ZipExtFile` stops at the declared size. The claim was
+  wrong and is corrected here.
 - Reading a project file that is a dehydrated OneDrive placeholder makes OneDrive download it,
   although `--apply` was not given.
 - The name lookup for the two TCP probes is not bounded by `--timeout`, only the connects are.
@@ -547,7 +640,37 @@ empty unless `--apply` was given, and the self-test asserts that across a whole 
   redirected. The `--report` files and `--json` are encoded for you and are not affected.
 - The report carries the account name, local paths, connection file names (names only, never
   contents), exclusion paths and layer names. Read it before you send it to anyone.
+- `user.config` is read with a 2 MB ceiling and any document type declaration in it is refused
+  outright. A real Pro `user.config` is a few kilobytes and has no DTD; expat expands internal
+  entities, so a few hundred bytes of nested declarations would otherwise be a million characters
+  before the parser finished. A file over the ceiling, or one carrying a DTD, is reported as unread
+  rather than as a set of unset settings.
+- The four child programs are started from `%SystemRoot%\System32` when that path exists, and by
+  bare name only when it does not.
+- The DNS lookup behind the two probes runs in a daemon thread this tool stops waiting for. A lookup
+  already in flight cannot be cancelled, so a resolver that never answers leaves one thread behind
+  for the rest of the process.
+- PF-16 walks the project folder at depth 3 with a 5000-entry bound, the same as every other walk
+  here. Rasters deeper than that, or in a folder this tool does not look at, are not counted, and the
+  folders it could not open are named.
+- PF-01 compares only the spatial references the project file actually records. A layer with none
+  inherits the map's, and calling that a mismatch would be a verdict about something the file does
+  not say.
+- PF-18 reads `Get-PhysicalDisk`. A disk behind a RAID or storage-space controller commonly answers
+  `Unspecified`, and is graded as possibly rotational rather than as fine.
+- PF-20 reads the boot-time `PagingFiles` value. System managed is reported as `Info`, because
+  Windows decides the size at boot and does not write the number there.
+- PF-21 grades the negotiated speed, not the rated one. An adapter whose speed string this tool does
+  not recognise is `Info`, not a pass.
 - If `--report` cannot be written, the exit code is 64 whatever the findings were.
+- The HTML report is a rendering of the same document, not a second reading: it can be no more
+  determined than the run behind it. Its filters need JavaScript; without it every check stays
+  visible and nothing is hidden.
+- The toolbox writes into a folder you name and creates it if it is missing. It does not check that
+  the folder is one you meant, and ArcGIS Pro runs it with the privileges of the Pro session.
+- `tests/test_toolbox.py` executes the `.pyt` against a stand-in `arcpy`, which is enough to prove
+  the parameter surface, the validation and the file writes, and not enough to prove that ArcGIS Pro
+  itself accepts the `datatype` names. Open the toolbox once in Pro before you rely on it.
 
 ## Sources
 
