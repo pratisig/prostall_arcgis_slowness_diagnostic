@@ -1,41 +1,57 @@
-# prostall pour ArcGIS Pro — toolbox et rapport HTML
+# ArcGIS Pro Performance Analyser — toolbox et rapport HTML
 
-Une **Python Toolbox** (`.pyt`) qui expose `prostall.py` dans ArcGIS Pro et rend
-le résultat en **un fichier HTML autonome** (aucune ressource externe, filtres
-locaux, JSON embarqué pour le diff).
+Une **Python Toolbox** (`.pyt`) qui expose le diagnostic de poste dans ArcGIS Pro
+et rend le résultat en **un fichier HTML autonome** (aucune ressource externe,
+filtres locaux, JSON embarqué pour le diff).
 
-Trois fichiers, à garder ensemble :
+## Un seul fichier
+
+Le moteur de diagnostic et le moteur de rendu sont **inlinés dans le `.pyt`**.
+Il n'y a aucun module voisin à garder à côté, donc rien qui puisse manquer sur
+le poste où le fichier atterrit.
 
 | Fichier | Rôle |
 |---|---|
-| `ProstallDiagnostic.pyt` | La toolbox : deux outils, leurs paramètres, leurs messages |
+| `ArcGISPro_PerformanceAnalyser.pyt` | **L'artefact livré.** Deux outils, moteur et rendu inclus |
+| `arcgis_pro_performance_analyser.py` | Le moteur de diagnostic et sa ligne de commande. Sans `arcpy` |
 | `html_report.py` | Le rendu HTML. Fonction pure sur le document de rapport, sans `arcpy` |
-| `prostall.py` | Le diagnostic lui-même (à la racine du dépôt, à copier ici) |
+| `toolbox_glue.py` | L'interface ArcGIS Pro. La seule partie qui importe `arcpy` |
+| `build_toolbox.py` | Assemble les trois fichiers ci-dessus en un seul `.pyt` |
+
+Le `.pyt` est **généré** : on modifie les sources, puis on lance
+`python build_toolbox.py`. On ne modifie jamais le `.pyt` à la main —
+`tests/test_toolbox.py` relance la génération et compare octet par octet, donc un
+artefact qui a dérivé de ses sources ne peut pas rester dans le dépôt sans être
+vu.
+
+Les sources restent séparées parce qu'elles sont testables séparément : le
+moteur se teste sans ArcGIS installé, le rendu est une fonction pure, et seule
+l'interface a besoin d'`arcpy`. La fusion est une concaténation, et la
+génération s'arrête si deux sources définissent un jour le même nom au niveau
+module, parce que l'une masquerait l'autre silencieusement.
 
 ## Installation
 
-1. Copier ce dossier `toolbox/` dans un emplacement stable, par exemple
-   `C:\GIS\Tools\prostall_toolbox\`.
-2. Y copier `prostall.py` depuis la racine du dépôt. Les trois fichiers doivent
-   être dans le **même** dossier : le `.pyt` ajoute son propre dossier à
-   `sys.path` avant d'importer les modules voisins.
-3. Dans ArcGIS Pro : volet **Catalogue → Toolboxes → Add Toolbox**, pointer sur
-   `ProstallDiagnostic.pyt`.
-4. Les deux outils apparaissent sous **« prostall - ArcGIS Pro slowness »**.
+1. Copier `ArcGISPro_PerformanceAnalyser.pyt` dans un emplacement stable, par
+   exemple `C:\GIS\Tools\`.
+2. Dans ArcGIS Pro : volet **Catalogue → Toolboxes → Add Toolbox**, pointer sur
+   ce fichier.
+3. Les deux outils apparaissent sous **« ArcGIS Pro Performance Analyser »**.
 
-Prérequis : ArcGIS Pro 3.x (Python 3.9+), bibliothèque standard uniquement.
-`prostall` n'utilise ni `arcpy` ni le package `arcgis`.
+C'est tout : il n'y a pas d'étape 4. Prérequis : ArcGIS Pro 3.x (Python 3.9+),
+bibliothèque standard uniquement.
 
 ## Les deux outils
 
 ### 1. Diagnose ArcGIS Pro slowness
 
-Lit le poste et écrit `prostall_<horodatage>.html`, `.json` et `.txt` dans le
-dossier de sortie, puis ouvre le HTML dans le navigateur par défaut.
+Lit le poste et écrit `arcgis_pro_performance_analyser_<horodatage>.html`,
+`.json` et `.txt` dans le dossier de sortie, puis ouvre le HTML dans le
+navigateur par défaut.
 
 | Paramètre | Défaut | Effet |
 |---|---|---|
-| Output folder | `<scratch>\prostall` | Où écrire les trois fichiers |
+| Output folder | `<scratch>\ArcGISPro_PerformanceAnalyser` | Où écrire les trois fichiers |
 | Enterprise geodatabase host to probe | vide | Sonde TCP bornée, connect uniquement, sans identifiant. Vide = aucun hôte contacté |
 | Geodatabase port | 1433 | Port de cette sonde |
 | Portal host to probe | vide | Sonde TCP sur 443 |
@@ -48,12 +64,13 @@ dossier de sortie, puis ouvre le HTML dans le navigateur par défaut.
 Le chemin du HTML est un **paramètre de sortie dérivé** : l'outil peut être
 enchaîné dans un modèle ModelBuilder.
 
-### 2. Verify prostall (offline self-test)
+### 2. Verify the analyser (offline self-test)
 
-Lance les assertions internes de prostall sur des postes de travail de
-substitution (les 708 assertions). Ne lit aucun registre, n'écrit rien, ne
-contacte aucun hôte. À lancer avant de faire confiance à un rapport sur une
-nouvelle machine.
+Lance les assertions internes du moteur sur des postes de travail de
+substitution (708 assertions). Ne lit aucun registre, n'écrit rien, ne contacte
+aucun hôte. À lancer avant de faire confiance à un rapport sur une nouvelle
+machine : cela vérifie que le fichier qu'on vous a donné passe toujours ses
+propres tests.
 
 ## ⚠️ À lire avant d'interpréter un résultat lancé depuis Pro
 
@@ -62,16 +79,17 @@ Ce n'est pas un détail :
 
 - **DL-12** signale Pro en cours d'exécution — c'est une trouvaille de perte de
   données à part entière, elle remonte dans la liste « act on these first ».
-- **PF-22** (lecture des temporisateurs de rafraîchissement dans le `.aprx`)
-  est **refusée**. Lire un fichier projet pendant que Pro peut l'enregistrer
-  peut faire échouer l'enregistrement : l'outil refuse plutôt que de provoquer
-  la panne qu'on lui demande d'expliquer.
+- Les **cinq contrôles qui lisent le fichier projet — PF-01, PF-09, PF-10,
+  PF-14 et PF-22 — sont refusés**. Lire un `.aprx` pendant que Pro peut
+  l'enregistrer peut faire échouer l'enregistrement : l'outil refuse plutôt que
+  de provoquer la panne qu'on lui demande d'expliquer. Chacun répond `Info` avec
+  sa raison, jamais un verdict inventé.
 - **AP-01** (le correctif de cache) est **refusé** pour la même raison.
 
 Un lancement depuis Pro est donc un rapport poste **moins** les contrôles de
 fichier projet. Pour le rapport complet : fermer Pro et lancer
-`python prostall.py` en ligne de commande, **dans la session de l'éditrice**,
-sans élévation.
+`python arcgis_pro_performance_analyser.py` en ligne de commande, **dans la
+session de l'éditrice**, sans élévation.
 
 Rien ici ne s'authentifie nulle part, aucun hôte n'est contacté sauf ceux que
 vous nommez, et rien ne change sur la machine tant que « Apply the gated fixes »
@@ -96,7 +114,7 @@ mesure**.
 Le score coûte 12 points par anomalie et 6 par avertissement — 18 et 9 quand la
 trouvaille porte sur des modifications perdues. **Un lancement qui n'a rien pu
 mesurer n'a pas de score du tout** : la jauge affiche `n/d`. Un cadran vert sur
-un poste illisible serait exactement le défaut que prostall existe pour
+un poste illisible serait exactement le défaut que cet outil existe pour
 empêcher, déplacé en aval.
 
 ### Jauges
@@ -140,7 +158,7 @@ l'opérateur : noms de comptes, chemins sur un partage, descriptions de cartes
 réseau, chemins d'exclusion Defender, texte du journal d'événements. Un nom de
 dossier sur un serveur de fichiers peut donc contenir du balisage.
 
-`html_report.py` échappe systématiquement tout ce qu'il écrit, et le bloc JSON
+Le moteur de rendu échappe systématiquement tout ce qu'il écrit, et le bloc JSON
 embarqué encode `<`, `>` et `&` en `\u003c` / `\u003e` / `\u0026` : aucune
 chaîne du rapport ne peut être lue comme du balisage, et aucune ne peut fermer
 l'élément `<script>` en avance. Le JSON se décode toujours à l'identique.
@@ -150,14 +168,21 @@ payload.
 ## Vérifier
 
 ```
-python tests/test_toolbox.py      # 77 assertions sur le rendu et la toolbox
-python prostall.py --self-test    # 708 assertions sur le diagnostic
+python tests/test_toolbox.py      # 82 assertions : rendu, interface et .pyt généré
+python arcgis_pro_performance_analyser.py --self-test   # 708 assertions sur le diagnostic
+python build_toolbox.py --check   # le .pyt livré est bien ce que ses sources produisent
 ```
 
 `tests/test_toolbox.py` n'a besoin que de la bibliothèque standard : il exécute
 le `.pyt` contre un module `arcpy` de substitution, donc ce sont bien
 `getParameterInfo`, `updateMessages` et `execute` de la toolbox qui tournent,
 jusqu'à l'écriture réelle des trois fichiers.
+
+Un détail que ce test épingle : le `.pyt` embarque **sa propre copie** du moteur.
+Remplacer `run()` dans le module importé séparément ne change donc rien à ce que
+fait l'outil — le test remplace la fonction dans le `.pyt`, et vérifie que les
+deux ne sont pas le même objet, pour qu'un futur test ne puisse pas passer à
+côté en patchant la mauvaise copie.
 
 ## Confidentialité
 

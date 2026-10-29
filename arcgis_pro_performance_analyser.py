@@ -24,11 +24,11 @@ here deletes anything. The network probes are opt-in: without --sde-server and
 already lives on a share: reading it crosses the network, as Pro does when it
 opens the project, and PF-03 times one listing of it.
 
-    python prostall.py --self-test
-    python prostall.py
-    python prostall.py --sde-server gisdb01 --portal gis.example.org --verbose
-    python prostall.py --report C:\Temp\properf
-    python prostall.py --apply
+    python arcgis_pro_performance_analyser.py --self-test
+    python arcgis_pro_performance_analyser.py
+    python arcgis_pro_performance_analyser.py --sde-server gisdb01 --portal gis.example.org --verbose
+    python arcgis_pro_performance_analyser.py --report C:\Temp\properf
+    python arcgis_pro_performance_analyser.py --apply
 
 Exit codes: 0 nothing to act on, 1 performance findings only, 2 at least one
 finding bearing on lost edits, 3 no finding but nothing was determined either,
@@ -102,7 +102,7 @@ SYMPTOMS = (
 # an older report from a known-good workstation fails loudly instead of quietly.
 # 2 adds the kpi mapping on the checks that measure a number, which is what the
 # HTML report draws its gauges from.
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 
 # Thresholds, named here rather than buried at the call site.
 SDE_LATENCY_WARN_MS = 250       # a LAN SQL host answers far inside this
@@ -4156,9 +4156,8 @@ def fix_cache_aside(env, checks, facts):
     path = facts.get("cache_path")
     if not path or not env.isdir(path):
         return None
-    moved = "%s.prostall-%s" % (path,
-                                time.strftime("%Y%m%d%H%M%S",
-                                              time.gmtime(env.now())))
+    moved = "%s.properf-%s" % (
+        path, time.strftime("%Y%m%d%H%M%S", time.gmtime(env.now())))
     moved = unique_path(moved)
     env.rename(path, moved)
     src, dst = quote_cmd(moved), quote_cmd(path)
@@ -4249,7 +4248,7 @@ def run(env, opts):
     checks, facts = run_checks(env, opts)
     applied, notes = apply_fixes(checks, env, facts, opts.get("apply", False))
     return {
-        "prostall": REPORT_VERSION,
+        "report_version": REPORT_VERSION,
         "taken": stamp(env.now()),
         "user": env.username(),
         "elevated": env.elevated(),
@@ -4268,7 +4267,8 @@ def run(env, opts):
 
 def render(document, verbose=False):
     """The console and text report, as a list of lines."""
-    lines = ["prostall %d  -  ArcGIS Pro workstation diagnostic" % REPORT_VERSION,
+    lines = ["ArcGIS Pro Performance Analyser %d  -  workstation diagnostic"
+             % REPORT_VERSION,
              "taken %s UTC as %s (elevated: %s)"
              % (document["taken"], document["user"], document["elevated"]),
              ""]
@@ -4375,8 +4375,8 @@ def write_report(document, directory, verbose=False):
     """Write the text and JSON reports. Returns the two paths."""
     if not os.path.isdir(directory):
         os.makedirs(directory)
-    base = "prostall_%s" % time.strftime("%Y%m%d_%H%M%S",
-                                         time.gmtime(time.time()))
+    base = "arcgis_pro_performance_analyser_%s" % time.strftime(
+        "%Y%m%d_%H%M%S", time.gmtime(time.time()))
     text_path = unique_path(os.path.join(directory, base + ".txt"))
     json_path = unique_path(os.path.join(directory, base + ".json"))
     handle = open(text_path, "wb")
@@ -6379,7 +6379,7 @@ def self_test():
     check(undo.startswith("reg delete"),
           "and the undo deletes it again, because there was no previous value")
     cache_record = [r for r in applied_run["applied"] if r["id"] == "AP-01"][0]
-    check(".prostall-" in cache_record["result"],
+    check(".properf-" in cache_record["result"],
           "the cache folder is renamed aside, never deleted  <-- pinned defect")
     check(cache_record["undo"].startswith("move "),
           "and the undo moves it straight back")
@@ -6447,7 +6447,7 @@ def self_test():
           "and a check that carries no impact, fix or expected text prints "
           "none of those headings empty")
 
-    temp_dir = tempfile.mkdtemp(prefix="prostall-selftest-")
+    temp_dir = tempfile.mkdtemp(prefix="properf-selftest-")
     try:
         text_path, json_path = write_report(document, temp_dir)
         check(os.path.isfile(text_path) and os.path.isfile(json_path),
@@ -6457,7 +6457,7 @@ def self_test():
             reloaded = json.loads(handle.read())
         finally:
             handle.close()
-        check(reloaded["prostall"] == REPORT_VERSION,
+        check(reloaded["report_version"] == REPORT_VERSION,
               "the JSON report carries its format version, so a diff against "
               "an older report from another workstation fails loudly")
         check(reloaded["act_first"] == document["act_first"],
@@ -6553,7 +6553,7 @@ def self_test():
           "so is an impossible port")
     check(quiet_main(["--sde-port", "70000"])[0] == 64,
           "at either end of the range")
-    blocked = tempfile.mkdtemp(prefix="prostall-blocked-")
+    blocked = tempfile.mkdtemp(prefix="properf-blocked-")
     try:
         wall = os.path.join(blocked, "wall")
         handle = io.open(wall, "w", encoding="utf-8")
@@ -6586,13 +6586,13 @@ def self_test():
     check(live.elevated() in (True, False),
           "the elevation question answers yes or no, never an exception")
     check(live.getenv("PATH"), "an environment variable that exists is read")
-    check(live.getenv("PROSTALL_NOTHING_SETS_THIS") is None,
+    check(live.getenv("PROPERF_NOTHING_SETS_THIS") is None,
           "and one that does not is None, not an empty string")
     check(live.registry_readable() is (os.name == "nt"),
           "the registry is readable exactly on Windows, and the checks that "
           "depend on it are told so rather than guessing from a None")
 
-    root = tempfile.mkdtemp(prefix="prostall-live-")
+    root = tempfile.mkdtemp(prefix="properf-live-")
     try:
         sub = os.path.join(root, "sub")
         deep = os.path.join(sub, "deep")
@@ -6725,20 +6725,20 @@ def self_test():
           "empty result")
     ghost = Env()
     ghost.windows = True
-    ghost.powershell = "prostall-no-such-program"
-    ghost.wevtutil = "prostall-no-such-program"
+    ghost.powershell = "properf-no-such-program"
+    ghost.wevtutil = "properf-no-such-program"
     check(ghost._powershell_json("1")[1] and ghost.events("System", "*",
                                                           1)[1],
           "a reader program that is not installed is a reason, not a "
           "traceback and not an empty answer")
-    check(live.reg_subkeys(r"HKCU\Software\prostall-nothing-here") == [],
+    check(live.reg_subkeys(r"HKCU\Software\properf-nothing-here") == [],
           "a registry key that is not there lists no subkeys")
 
     data, reason = live._powershell_json("ConvertTo-Json -InputObject @(7)")
     check((data is None) != (reason is None),
           "a PowerShell read answers data or a reason, never both and never "
           "neither")
-    check(live._powershell_json("throw 'prostall'")[1],
+    check(live._powershell_json("throw 'properf'")[1],
           "a script that throws is a reason, not an empty answer")
     check(live._powershell_json("Write-Output 'not json'")[1],
           "and output that is not JSON is a reason too")
@@ -6746,7 +6746,7 @@ def self_test():
         data, reason = getattr(live, name)()
         check((data is None) != (reason is None),
               "the %s read on this machine answers data or a reason" % name)
-    check(live.events("Prostall-No-Such/Log", "*", 1)[1],
+    check(live.events("Properf-No-Such/Log", "*", 1)[1],
           "a log that does not exist is an error, not an empty timeline  "
           "<-- pinned defect")
     text, reason = live.events("Application", "*[System[EventID=999999]]", 1)
@@ -6754,7 +6754,7 @@ def self_test():
           "a query nothing matches is an empty list where the log can be "
           "read, and a reason where it cannot")
 
-    zroot = tempfile.mkdtemp(prefix="prostall-zip-")
+    zroot = tempfile.mkdtemp(prefix="properf-zip-")
     froot = None
     try:
         import zipfile
@@ -6794,7 +6794,7 @@ def self_test():
         # and a diagnostic's own test fixtures are not part of the folder it
         # is timing.
         import struct
-        froot = tempfile.mkdtemp(prefix="prostall-forged-")
+        froot = tempfile.mkdtemp(prefix="properf-forged-")
         lying = os.path.join(froot, "lying.aprx")
         payload = b"A" * (4 * 1024 * 1024)
         with zipfile.ZipFile(lying, "w", zipfile.ZIP_DEFLATED) as zarch:
@@ -6891,9 +6891,10 @@ def self_test():
           "and an ordinary project still yields its timers after the walk was "
           "made iterative")
 
-    probe_dir = tempfile.mkdtemp(prefix="prostall-uniq-")
+    probe_dir = tempfile.mkdtemp(prefix="properf-uniq-")
     try:
-        target = os.path.join(probe_dir, "prostall_20260101_000000.txt")
+        target = os.path.join(
+            probe_dir, "arcgis_pro_performance_analyser_20260101_000000.txt")
         check(unique_path(target) == target,
               "a name nobody has taken is left alone")
         handle = io.open(target, "w")
@@ -6940,7 +6941,7 @@ def self_test():
           "full path: Windows searches the current directory first for a bare "
           "name, so a bare name run from somebody else's folder can run "
           "their file  <-- pinned defect")
-    check(rooted.system32("prostall-not-here.exe") == "prostall-not-here.exe",
+    check(rooted.system32("properf-not-here.exe") == "properf-not-here.exe",
           "while a name that is not there is left as it was")
 
     live_tcp = Env()
@@ -6973,7 +6974,7 @@ def self_test():
           "a real run exits 0, 1, 2 or 3, whatever this machine turns out to "
           "be")
     live_document = json.loads(printed)
-    check(live_document["prostall"] == 2,
+    check(live_document["report_version"] == 3,
           "the JSON it prints carries report version 2, the number a diff "
           "against a known-good workstation is taken at: comparing it to the "
           "constant that defines it would hold for any value")
@@ -6989,7 +6990,7 @@ def self_test():
           "and not one record of a real run pairs a verdict with text saying "
           "it measured nothing  <-- pinned defect")
 
-    report_dir = tempfile.mkdtemp(prefix="prostall-live-report-")
+    report_dir = tempfile.mkdtemp(prefix="properf-live-report-")
     try:
         code, printed = captured(
             lambda: main(["--report", os.path.join(report_dir, "out"),
@@ -7438,10 +7439,10 @@ def self_test():
           "while a stream that cannot be reconfigured is left alone")
 
     # --json is one document, with or without --report.
-    jr_dir = tempfile.mkdtemp(prefix="prostall-json-report-")
+    jr_dir = tempfile.mkdtemp(prefix="properf-json-report-")
     try:
         code, out, err = with_env(fake_healthy, ["--json", "--report", jr_dir])
-        check(json.loads(out)["prostall"] == 2,
+        check(json.loads(out)["report_version"] == 3,
               "--json with --report prints one JSON document on stdout  "
               "<-- pinned defect")
         check("report :" in err and "report :" not in out,
@@ -7455,7 +7456,7 @@ def self_test():
 
     code, out, err = with_env(OffMachine, ["--json"])
     check("almost every probe" in err and "almost every probe" not in out
-          and json.loads(out)["prostall"] == 2,
+          and json.loads(out)["report_version"] == 3,
           "off Windows the note goes to stderr and stdout stays a document")
 
     # The reading layer, reached with stand-ins instead of left unreached.
@@ -7535,7 +7536,7 @@ def self_test():
     check(dir_error is False and file_error is False and list_error == [],
           "a folder that vanishes or locks mid-read answers absence, never a "
           "traceback")
-    scan_root = tempfile.mkdtemp(prefix="prostall-scan-")
+    scan_root = tempfile.mkdtemp(prefix="properf-scan-")
     try:
         for name in ("a.txt", "b.txt"):
             handle = io.open(os.path.join(scan_root, name), "w")
@@ -7580,7 +7581,7 @@ def self_test():
     check(summarize(2, []) == (["2 assertions, 0 failed"], 0),
           "and a clean one exits 0")
     imported = runpy.run_path(os.path.abspath(__file__),
-                              run_name="prostall_imported")
+                              run_name="properf_imported")
     check(callable(imported["main"]),
           "importing the file defines the tool and runs nothing")
 
@@ -7752,7 +7753,7 @@ def make_output_safe(stream):
 
 def _parse(argv):
     ap = _Parser(
-        prog="prostall.py",
+        prog="arcgis_pro_performance_analyser.py",
         allow_abbrev=False,
         description="Diagnose why ArcGIS Pro is slow on this workstation, and "
                     "never report a finding the machine did not produce.",

@@ -1,17 +1,18 @@
-r"""prostall for ArcGIS Pro - a Python Toolbox wrapping the workstation
-diagnostic, with the result as a self-contained HTML report.
+r"""The ArcGIS Pro glue: two geoprocessing tools over the diagnostic engine
+and the HTML renderer.
 
-Install
--------
-Copy this whole folder anywhere stable (for example
-C:\GIS\Tools\prostall_toolbox) and keep prostall.py, html_report.py and
-ProstallDiagnostic.pyt together. In ArcGIS Pro: Catalog pane > Toolboxes >
-Add Toolbox, and point at ProstallDiagnostic.pyt. The two tools appear under
-"prostall - ArcGIS Pro slowness".
+This file is a build input, not the shipped artefact. build_toolbox.py inlines
+it below the engine and the renderer to produce the single file
+ArcGISPro_PerformanceAnalyser/ArcGISPro_PerformanceAnalyser.pyt, and that one
+file is what you add to ArcGIS Pro. It stays a separate source because it is
+the only part that imports arcpy, so the engine and the renderer can be tested
+on a machine with no ArcGIS at all.
+
+The two tools appear under "ArcGIS Pro Performance Analyser".
 
 Run "Diagnose ArcGIS Pro slowness" from the Geoprocessing pane. It writes
-prostall_<stamp>.html, .json and .txt into the output folder and opens the
-HTML in the default browser.
+arcgis_pro_performance_analyser_<stamp>.html, .json and .txt into the output
+folder and opens the HTML in the default browser.
 
 Read this before you trust the numbers
 --------------------------------------
@@ -26,7 +27,7 @@ That is not a detail:
   * AP-01, the cache fix, is refused for the same reason.
 
 So a run from inside Pro is a workstation report minus the project-file
-checks. For the complete report, close Pro and run prostall.py from a command
+checks. For the complete report, close Pro and run arcgis_pro_performance_analyser.py from a command
 prompt in the editor's own session. The toolbox exists for the run you can do
 without leaving the application, and it says so on the page.
 
@@ -35,19 +36,17 @@ and no machine state changes unless you tick "Apply the gated fixes".
 """
 
 import os
-import sys
 import time
 
 import arcpy
 
-# The .pyt's own folder, so the sibling modules resolve however ArcGIS Pro
-# chose to load the toolbox.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-import prostall            # noqa: E402  after the sys.path bootstrap
-import html_report         # noqa: E402
+# BEGIN MERGE-IMPORTS
+# build_toolbox.py replaces this block when it inlines the two modules into the
+# single-file .pyt. There, the engine and the renderer are defined above in this
+# same module, so the same qualified names are served from its globals.
+import arcgis_pro_performance_analyser as engine
+import html_report as report
+# END MERGE-IMPORTS
 
 
 def _pro_release():
@@ -62,7 +61,7 @@ def _pro_release():
 def _unique(path):
     """A path that does not already exist.
 
-    prostall's own report writer stamps to the second, so two runs inside one
+    the analyser's own report writer stamps to the second, so two runs inside one
     second land on the same name and the second silently overwrites the first.
     """
     root, ext = os.path.splitext(path)
@@ -83,13 +82,13 @@ def _tail(text, lines=40):
 
 class Toolbox(object):
     def __init__(self):
-        self.label = "prostall - ArcGIS Pro slowness"
-        self.alias = "prostall"
+        self.label = "ArcGIS Pro Performance Analyser"
+        self.alias = "properf"
         self.description = (
             "Diagnose why ArcGIS Pro is slow on this workstation, and never "
             "report a finding the machine did not produce. Read-only unless "
             "you enable the fixes.")
-        self.tools = [Diagnose, VerifyProstall]
+        self.tools = [Diagnose, VerifyAnalyser]
         self.canRunInBackground = False
 
 
@@ -116,7 +115,7 @@ class Diagnose(object):
             direction="Input")
         out.value = os.path.join(
             arcpy.env.scratchFolder or os.environ.get("TEMP") or ".",
-            "prostall")
+            "ArcGISPro_PerformanceAnalyser")
 
         sde = arcpy.Parameter(
             displayName="Enterprise geodatabase host to probe",
@@ -203,7 +202,7 @@ class Diagnose(object):
         return
 
     def updateMessages(self, parameters):
-        """Refuse what prostall's own parser would refuse, before it runs."""
+        """Refuse what the analyser's own parser would refuse, before it runs."""
         port = parameters[2].value
         if port is not None and not 1 <= int(port) <= 65535:
             parameters[2].setErrorMessage(
@@ -215,7 +214,7 @@ class Diagnose(object):
         for index, flag in ((1, "geodatabase host"), (3, "portal host")):
             host = parameters[index].valueAsText
             if host:
-                problem = prostall.host_problem(host)
+                problem = engine.host_problem(host)
                 if problem:
                     parameters[index].setErrorMessage(
                         "%r is not a host name: %s" % (host, problem))
@@ -224,13 +223,13 @@ class Diagnose(object):
                 "You are running this from inside ArcGIS Pro, so DL-12 reports "
                 "Pro as running and the cache fix (AP-01) is refused. Only the "
                 "GPU preference (AP-02) can apply. Both print their own undo "
-                "command, and neither deletes anything. Run prostall.py from a "
+                "command, and neither deletes anything. Run arcgis_pro_performance_analyser.py from a "
                 "command prompt with Pro closed for the full set of fixes.")
         return
 
     def execute(self, parameters, messages):
         folder = (parameters[0].valueAsText
-                  or os.path.join(os.environ.get("TEMP") or ".", "prostall"))
+                  or os.path.join(os.environ.get("TEMP") or ".", "ArcGISPro_PerformanceAnalyser"))
         opts = {
             "sde_server": parameters[1].valueAsText or None,
             "sde_port": int(parameters[2].value or 1433),
@@ -240,8 +239,8 @@ class Diagnose(object):
         }
         verbose = bool(parameters[5].value)
 
-        messages.addMessage("prostall %d - reading this workstation."
-                            % prostall.REPORT_VERSION)
+        messages.addMessage("ArcGIS Pro Performance Analyser %d - reading this workstation."
+                            % engine.REPORT_VERSION)
         if opts["sde_server"] or opts["portal"]:
             messages.addMessage(
                 "Network probes: %s"
@@ -256,17 +255,17 @@ class Diagnose(object):
             "PF-03 times one listing of it.")
 
         started = time.time()
-        env = prostall.Env()
-        document = prostall.run(env, opts)
-        code = prostall.exit_code(document["checks"])
+        env = engine.Env()
+        document = engine.run(env, opts)
+        code = engine.exit_code(document["checks"])
         document["exit_code"] = code
-        document["symptoms"] = list(prostall.SYMPTOMS)
+        document["symptoms"] = list(engine.SYMPTOMS)
         messages.addMessage("Read %d checks in %.1f s."
                             % (len(document["checks"]), time.time() - started))
 
         if not os.path.isdir(folder):
             os.makedirs(folder)
-        html_path = _unique(os.path.join(folder, "prostall.html"))
+        html_path = _unique(os.path.join(folder, "arcgis_pro_performance_analyser.html"))
         json_path = os.path.splitext(html_path)[0] + ".json"
 
         meta = {}
@@ -275,7 +274,7 @@ class Diagnose(object):
             meta["ArcGIS Pro"] = release
         meta["ran from"] = "the ArcGIS Pro geoprocessing pane, so Pro was open"
 
-        html_report.write_html(document, html_path, verbose, code, meta)
+        report.write_html(document, html_path, verbose, code, meta)
         handle = open(json_path, "wb")
         try:
             import json as _json
@@ -289,7 +288,7 @@ class Diagnose(object):
             text_path = os.path.splitext(html_path)[0] + ".txt"
             handle = open(text_path, "wb")
             try:
-                handle.write(("\n".join(prostall.render(document, verbose))
+                handle.write(("\n".join(engine.render(document, verbose))
                               + "\n").encode("utf-8"))
             finally:
                 handle.close()
@@ -297,7 +296,7 @@ class Diagnose(object):
 
         # The summary, in the messages window, so the operator sees the
         # verdict without leaving ArcGIS Pro.
-        for status, count in prostall.counts(document["checks"]):
+        for status, count in engine.counts(document["checks"]):
             if count:
                 messages.addMessage("  %-8s %d" % (status.upper(), count))
         if document["act_first"]:
@@ -329,24 +328,24 @@ class Diagnose(object):
         messages.addMessage(
             "The report carries the account name, local paths, connection file "
             "names and exclusion paths. Read it before you send it to anyone.")
-        messages.addMessage("prostall exit code %d: %s"
-                            % (code, html_report.EXIT_MEANING.get(code, "?")))
+        messages.addMessage("Analyser exit code %d: %s"
+                            % (code, report.EXIT_MEANING.get(code, "?")))
         return
 
 
-class VerifyProstall(object):
-    """Run prostall's own offline assertions.
+class VerifyAnalyser(object):
+    """Run the analyser's own offline assertions.
 
     The tool's whole claim is that it never reports a finding the machine did
-    not produce, and that claim is enforced by 600-odd assertions over the
-    decision functions. Run this before you trust a report from a new machine.
+    not produce, and that claim is enforced by the engine's own offline
+    assertions over its decision functions. Run this before you trust a report from a new machine.
     It reads no registry, writes nothing and contacts no host.
     """
 
     def __init__(self):
-        self.label = "Verify prostall (offline self-test)"
+        self.label = "Verify the analyser (offline self-test)"
         self.description = (
-            "Run prostall's offline assertions over its own decision "
+            "Run the analyser's offline assertions over its own decision "
             "functions, on stand-in workstations, and report how many passed. "
             "Reads no registry, writes nothing, contacts no host.")
         self.canRunInBackground = False
@@ -378,7 +377,7 @@ class VerifyProstall(object):
         started = time.time()
         try:
             with contextlib.redirect_stdout(buffer):
-                code = prostall.self_test()
+                code = engine.self_test()
         except Exception as exc:
             messages.addErrorMessage("The self-test could not run: %s: %s"
                                      % (type(exc).__name__, exc))
