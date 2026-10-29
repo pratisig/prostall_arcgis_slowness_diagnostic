@@ -97,7 +97,7 @@ que la garantie ne rapporte : **l'outil a été retiré de la boîte à outils.*
 Il reste disponible en ligne de commande, pour le développement :
 
 ```
-python arcgis_pro_performance_analyser.py --self-test   # 743 assertions
+python arcgis_pro_performance_analyser.py --self-test   # 751 assertions
 ```
 
 Une assertion que la machine ne peut pas lancer est annoncée `SKIP` avec sa
@@ -219,15 +219,25 @@ contrôle sans source honnête n'en reçoit pas d'inventée.
 Ce sont des **liens de navigation** : la page du rapport ne télécharge rien
 depuis ces hôtes, elle s'ouvre donc aussi bien sur un poste isolé du réseau.
 
-Les seuils de cet outil sont **les siens** : ce sont des tolérances choisies pour
-décider « conforme / à surveiller », pas des limites publiées par Esri. Ce qui
-suit est ce qui a été consulté pour écrire les pistes de correction, avec ce que
-chacun apporte réellement ici.
+**Là où Esri publie un chiffre, c'est le chiffre d'Esri qui est utilisé et le
+rapport le dit.** Les prérequis officiels (processeur, mémoire, stockage, carte
+graphique) sont repris tels quels, avec leurs trois paliers — minimum,
+recommandé, optimal — pour que vous sachiez si vous êtes en dessous du minimum
+ou seulement en dessous du recommandé.
+
+Les autres seuils restent **ceux de cet outil** : des tolérances choisies pour
+décider « conforme / à surveiller » sur des points qu'Esri ne chiffre pas
+(latence réseau, âge d'un pilote, poids d'une géodatabase). Le rapport distingue
+les deux : une ligne cite Esri, l'autre dit « tolérance de cet outil ».
+
+Ce qui suit est ce qui a été consulté pour écrire les pistes de correction, avec
+ce que chacun apporte réellement ici.
 
 ### Documentation Esri
 
 | Source | Ce qu'on y prend |
 |---|---|
+| [Configuration système requise pour ArcGIS Pro](https://doc.esri.com/fr/arcgis-pro/latest/get-started/arcgis-pro-system-requirements.html) — **chiffres publiés par Esri** (3.7, et la version 3.6 en anglais) | **Processeur** : minimum 2 cœurs avec multithreading simultané, recommandé 4, optimal 10 (**PF-28**). **Mémoire** : minimum 8 Go, recommandé 32, optimal 64 (**PF-12**). **Stockage** : 32 Go libres au minimum, sur SSD en recommandé, et le cache de visualisation seul peut prendre jusqu'à 32 Go (**PF-13**, **PF-06**). **Carte graphique** : discrète (non intégrée) recommandée, 8 Go de mémoire dédiée, et « utilisez le dernier pilote disponible » (**PF-29**, **PF-11**). **OneDrive et Google Drive ne sont pas pris en charge** (**DL-05**, **DL-06**, **DL-07**). Certains outils de géotraitement exigent un processeur AVX, et la recherche d'outils exige AVX2 |
 | [Settings that affect data access performance](https://doc.esri.com/en/arcgis-pro/latest/get-started/layer-map-project-perf-optimization.html) — documentation officielle ArcGIS Pro 3.7 | Reprojection à la volée quand les données ne sont pas dans la même référence spatiale (PF-01) ; coût des jointures et des requêtes de définition non sélectives (PF-14) ; poids des étiquettes et des `feature weights` (PF-14) ; intérêt des plages d'échelle de visibilité |
 | [Troubleshooting Performance Issues in ArcGIS Pro](https://community.esri.com/t5/arcgis-pro-documents/troubleshooting-performance-issues-in-arcgis-pro/ta-p/1025516) — Esri Community | Pilote de carte graphique à prendre chez le fabricant ; antivirus à écarter temporairement pour isoler la cause (PF-17) ; `WARP` dans le readout = Pro émule la carte graphique sur le processeur ; historique de géotraitement stocké dans le `.aprx` (PF-10) ; ne garder ouverts que les cartes et mises en page utiles (PF-10) |
 | [Why is ArcGIS Pro so slow?](https://community.esri.com/t5/arcgis-pro-questions/why-is-arcgis-pro-so-slow/td-p/508005/page/5) — Esri Community | Renommer les dossiers `ESRI` de `AppData\Local` et `AppData\Roaming` pour tester le cache (AP-01) ; autoriser `ArcGISPro.exe` dans le pare-feu Windows Defender ; latence réseau et données locales contre données en partage |
@@ -256,7 +266,7 @@ rapport le dit.
 
 ```
 python tests/test_toolbox.py      # 92 assertions : rendu, interface et .pyt généré
-python arcgis_pro_performance_analyser.py --self-test   # 743 assertions sur le diagnostic
+python arcgis_pro_performance_analyser.py --self-test   # 751 assertions sur le diagnostic
 python build_toolbox.py --check   # le .pyt livré est bien ce que ses sources produisent
 ```
 

@@ -46,7 +46,7 @@ applied change prints its own undo command, and nothing deletes anything.
 
 Provenance
 ----------
-  arcgis_pro_performance_analyser.py        8632 lines  sha256:ea114ebb33cb
+  arcgis_pro_performance_analyser.py        8754 lines  sha256:801b6e898dfb
   html_report.py                             890 lines  sha256:beb3f3098f4f
   toolbox_glue.py                            510 lines  sha256:081b144a742d
 """
@@ -55,7 +55,7 @@ from __future__ import print_function
 
 # ============================================================================
 # 1/3  diagnostic engine
-# source: arcgis_pro_performance_analyser.py  (sha256:ea114ebb33cb)
+# source: arcgis_pro_performance_analyser.py  (sha256:801b6e898dfb)
 # ----------------------------------------------------------------------------
 # r"""Diagnose why ArcGIS Pro is slow on this workstation, and never report a finding the machine did not produce.
 #
@@ -216,14 +216,42 @@ LINK_SPEED_MIN_MBPS = 1000
 # network volume is a stall nobody will find in the Pro logs.
 PAGEFILE_MIN_MB = 4096
 
-# Processor and graphics. Both thresholds are this tool's own allowances, not
-# published Esri figures: Esri's requirement pages are not reachable from
-# here, so nothing in this file claims to quote one.
-CPU_LOGICAL_MIN = 4            # below this, parallel geoprocessing starves
+# ---------------------------------------------------------------------------
+# Esri's PUBLISHED ArcGIS Pro system requirements, read off the official pages
+# (3.6 English and 3.7 French, both opened). These are Esri's figures, quoted,
+# and the report says whose figures they are. Everything else in this file is
+# an allowance this tool chose for itself, and says so.
+#
+#   https://doc.esri.com/fr/arcgis-pro/latest/get-started/
+#       arcgis-pro-system-requirements.html
+#   https://pro.arcgis.com/en/pro-app/3.6/get-started/
+#       arcgis-pro-system-requirements.htm
+# ---------------------------------------------------------------------------
+ESRI_CPU_MIN_CORES = 2         # minimum, with simultaneous multithreading
+ESRI_CPU_REC_CORES = 4         # recommended
+ESRI_CPU_OPT_CORES = 10        # optimal
+ESRI_RAM_MIN_GB = 8.0
+ESRI_RAM_REC_GB = 32.0
+ESRI_RAM_OPT_GB = 64.0
+ESRI_FREE_DISK_GB = 32.0       # minimum free, and on an SSD when recommended
+ESRI_VIZ_CACHE_GB = 32.0       # the visualization cache alone may take this
+ESRI_GPU_VRAM_REC_GB = 8.0     # dedicated, not shared
+
 GPU_DRIVER_MAX_DAYS = 365      # past a year, "update the driver" is the answer
 # Esri's own performance readout names WARP explicitly: it means Pro found no
 # capable GPU and is emulating one on the CPU, which is slow by construction.
 GPU_EMULATED_MARKERS = ("WARP", "BASIC DISPLAY", "MICROSOFT BASIC")
+# Esri recommends "a discrete (not integrated) GPU that is supported by the
+# manufacturer". A machine whose only adapter is integrated is below that
+# recommendation, which is a Warn and not a fault: it works, it just draws
+# slower, and on a notebook it is often the only option there is.
+GPU_INTEGRATED_MARKERS = ("INTEL UHD", "INTEL HD", "INTEL IRIS",
+                          "INTEL(R) HD", "INTEL(R) UHD", "INTEL(R) IRIS",
+                          "AMD RADEON(TM) GRAPHICS", "RADEON RX VEGA 8",
+                          "RADEON RX VEGA 11", "VEGA 8", "VEGA 11",
+                          "MICROSOFT BASIC")
+GPU_DISCRETE_MARKERS = ("GEFORCE", "RTX", "GTX", "QUADRO", "RTX PRO",
+                        "RADEON PRO", "RADEON RX", "TITAN", "ARC A")
 
 # Data folder weight. Measured by walking the folder a recent project lives
 # in, never by opening the .aprx: this check has to keep answering from inside
@@ -264,6 +292,10 @@ _ESRI_CA = ("Esri Canada - D&eacute;panner ArcGIS Pro comme un analyste du "
 _ESRI_PROJ = ("Esri Community - Vitesse d'un projet ArcGIS Pro",
               "https://community.esri.com/t5/arcgis-utility-network-questions/"
               "arcgis-pro-project-speed/td-p/1581320")
+_ESRI_REQ = ("Esri - Configuration syst\u00e8me requise pour ArcGIS Pro "
+             "(chiffres publi\u00e9s : minimum, recommand\u00e9, optimal)",
+             "https://doc.esri.com/fr/arcgis-pro/latest/get-started/"
+             "arcgis-pro-system-requirements.html")
 _MS_NIC = ("Microsoft - MSFT_NetAdapterPowerManagementSettingData",
            "https://learn.microsoft.com/en-us/previous-versions/windows/"
            "desktop/legacy/hh872363(v=vs.85)")
@@ -294,9 +326,9 @@ _R_SHUTS = ("r/gis - \u00ab it just shuts with no warning and no saving \u00bb",
 SOURCES = {
     "DL-03": [_ESRI_PROJ],
     "DL-04": [_MS_NIC],
-    "DL-05": [_R_ONEDRIVE, _R_ONEDRIVE2],
-    "DL-06": [_R_ONEDRIVE2, _R_ONEDRIVE],
-    "DL-07": [_R_ONEDRIVE],
+    "DL-05": [_ESRI_REQ, _R_ONEDRIVE, _R_ONEDRIVE2],
+    "DL-06": [_ESRI_REQ, _R_ONEDRIVE2, _R_ONEDRIVE],
+    "DL-07": [_ESRI_REQ, _R_ONEDRIVE],
     "DL-08": [_R_ONEDRIVE],
     "DL-09": [_ESRI_TROUBLE],
     "DL-10": [_ESRI_PERF],
@@ -308,27 +340,27 @@ SOURCES = {
     "PF-03": [_ESRI_CACHE],
     "PF-04": [_ESRI_TROUBLE],
     "PF-05": [_ESRI_TROUBLE, _ESRI_3D],
-    "PF-06": [_ESRI_TROUBLE, _ESRI_CACHE],
+    "PF-06": [_ESRI_TROUBLE, _ESRI_CACHE, _ESRI_REQ],
     "PF-07": [_ESRI_PROJ],
     "PF-08": [_ESRI_TROUBLE, _R_EDITSLOW, _ESRI_PROJ],
     "PF-09": [_ESRI_CACHE, _R_CRASH, _R_SLOWMAP],
     "PF-10": [_ESRI_TROUBLE, _ESRI_PROJ],
-    "PF-11": [_ESRI_TROUBLE, _ESRI_3D, _ESRI_CA],
-    "PF-12": [_ESRI_PROJ, _R_CRASH, _R_EDITSLOW],
-    "PF-13": [_ESRI_PROJ],
+    "PF-11": [_ESRI_TROUBLE, _ESRI_3D, _ESRI_CA, _ESRI_REQ],
+    "PF-12": [_ESRI_REQ, _ESRI_PROJ, _R_CRASH, _R_EDITSLOW],
+    "PF-13": [_ESRI_REQ, _ESRI_PROJ],
     "PF-14": [_ESRI_PERF],
     "PF-15": [_ESRI_CA],
     "PF-16": [_R_SLOWMAP, _ESRI_PERF],
     "PF-17": [_ESRI_TROUBLE],
-    "PF-18": [_R_EDITSLOW, _ESRI_CA],
+    "PF-18": [_ESRI_REQ, _R_EDITSLOW, _ESRI_CA],
     "PF-19": [_ESRI_PERF],
     "PF-20": [_ESRI_PROJ],
     "PF-21": [_ESRI_CACHE],
     "PF-22": [_ESRI_PERF],
     "PF-26": [_ESRI_PROJ],
     "PF-27": [_ESRI_PERF, _ESRI_3D],
-    "PF-28": [_R_SINGLE, _ESRI_CA],
-    "PF-29": [_ESRI_TROUBLE, _ESRI_3D],
+    "PF-28": [_ESRI_REQ, _R_SINGLE, _ESRI_CA],
+    "PF-29": [_ESRI_REQ, _ESRI_TROUBLE, _ESRI_3D],
     "PF-30": [_R_CRASH, _R_ONEDRIVE, _R_SLOWMAP],
 }
 
@@ -1488,7 +1520,13 @@ def decide_memory(total_gb, free_gb):
             observed="Installed and free memory could not be read on this "
                      "platform, so no verdict is given. This is a failed read, "
                      "not a hardware finding.",
-            expected="At least %.0f GB for enterprise editing." % MIN_MEMORY_GB,
+            expected="Esri's published requirement: minimum %.0f GB, recommended "
+                     "%.0f GB, optimal %.0f GB or more. This tool warns "
+                     "below %.0f GB, its own allowance for enterprise "
+                     "editing, which sits between Esri's minimum and "
+                     "recommended figures."
+                     % (ESRI_RAM_MIN_GB, ESRI_RAM_REC_GB, ESRI_RAM_OPT_GB,
+                        MIN_MEMORY_GB),
             impact="S1 and S2 undetermined.",
             fix="Read it by hand from Task Manager and re-run.")
     if total_gb < MIN_MEMORY_GB:
@@ -1522,8 +1560,12 @@ def decide_disk(volumes):
             title="Free disk space",
             observed="No volume could be read, so free space was not measured "
                      "this run.",
-            expected="At least %.0f GB and %.0f%% free."
-                     % (MIN_FREE_DISK_GB, MIN_FREE_DISK_PCT),
+            expected="Esri's published requirement is %.0f GB of free space, on an "
+                     "SSD when recommended; the visualization cache alone "
+                     "may take up to %.0f GB. This tool fails below %.0f GB "
+                     "or %.0f%% free, its own lower allowance."
+                     % (ESRI_FREE_DISK_GB, ESRI_VIZ_CACHE_GB,
+                        MIN_FREE_DISK_GB, MIN_FREE_DISK_PCT),
             impact="S1 and S2 undetermined.",
             fix="Read it by hand and re-run.")
     lines = []
@@ -3746,9 +3788,10 @@ def decide_cpu(rows, error):
     unexplained stall while every setting in the report is correct.
     """
     title = "Processor model, cores and clock"
-    expected = ("At least %d logical processors. This threshold is this "
-                "tool's own allowance, not a published Esri figure."
-                % CPU_LOGICAL_MIN)
+    expected = ("Esri's published requirement: minimum %d cores with "
+                "simultaneous multithreading, recommended %d cores, optimal "
+                "%d cores."
+                % (ESRI_CPU_MIN_CORES, ESRI_CPU_REC_CORES, ESRI_CPU_OPT_CORES))
     if error:
         return dict(cid="PF-28", category="Hardware", status="Info",
                     measured=False, title=title,
@@ -3777,21 +3820,37 @@ def decide_cpu(rows, error):
                 else "<clock not reported>") for r in clean]
     lines.append("totals: %d core(s), %d logical processor(s)"
                  % (cores, logical))
-    status = "Warn" if logical < CPU_LOGICAL_MIN else "Pass"
-    if logical < CPU_LOGICAL_MIN:
-        lines.append("fewer logical processors than this tool's allowance")
+    # Graded on CORES, because that is what Esri counts. Grading on logical
+    # processors would read a 2-core/4-thread chip - Esri's bare minimum - as
+    # if it met the 4-core recommendation.
+    if cores < ESRI_CPU_MIN_CORES:
+        status = "Fail"
+        lines.append("fewer cores than Esri's published minimum of %d"
+                     % ESRI_CPU_MIN_CORES)
+    elif cores < ESRI_CPU_REC_CORES:
+        status = "Warn"
+        lines.append("at Esri's published minimum of %d cores, below the "
+                     "recommended %d" % (ESRI_CPU_MIN_CORES,
+                                         ESRI_CPU_REC_CORES))
+    else:
+        status = "Pass"
     return dict(
         cid="PF-28", category="Hardware", status=status, title=title,
         observed=lines, expected=expected,
         impact="S1 and S2. ArcGIS Pro draws largely on one core, so a weak "
                "single-core clock shows up as a stall no setting explains; "
-               "the core count starves parallel geoprocessing instead.",
+               "the core count starves parallel geoprocessing instead. Esri "
+               "counts cores, not threads, so a chip reporting four logical "
+               "processors may still be a two-core part.",
         fix="Hardware is not configurable, so act on what is: close other "
             "applications before a heavy session, set the power plan to High "
             "performance (PF-15), and pin ArcGISPro.exe to the "
-            "high-performance GPU (PF-11). When specifying a machine, favour "
-            "single-core clock over core count. Do not buy hardware off this "
-            "one line.",
+            "high-performance GPU (PF-11). Esri's published tiers are %d "
+            "cores minimum, %d recommended, %d optimal; when specifying a "
+            "machine, favour single-core clock over core count, and note that "
+            "some geoprocessing tools need an AVX-capable processor and the "
+            "geoprocessing tool search needs AVX2."
+            % (ESRI_CPU_MIN_CORES, ESRI_CPU_REC_CORES, ESRI_CPU_OPT_CORES),
         kpi={"cores": cores, "logical": logical,
              "max_ghz": round(mhz / 1000.0, 2)})
 
@@ -3804,9 +3863,12 @@ def decide_gpu(rows, error, now):
     presents as a crash rather than as a slowdown.
     """
     title = "Graphics adapter and driver age"
-    expected = ("A driver from the GPU maker, less than %d days old. This "
-                "threshold is this tool's own allowance, not a published Esri "
-                "figure." % GPU_DRIVER_MAX_DAYS)
+    expected = ("Esri recommends a discrete - not integrated - GPU supported "
+                "by its manufacturer, with %d GB or more of dedicated "
+                "graphics memory, and says to use the latest available "
+                "driver. The %d-day age limit is this tool's own reading of "
+                "that instruction."
+                % (ESRI_GPU_VRAM_REC_GB, GPU_DRIVER_MAX_DAYS))
     if error:
         return dict(cid="PF-29", category="Hardware", status="Info",
                     measured=False, title=title,
@@ -3856,22 +3918,39 @@ def decide_gpu(rows, error, now):
                     fix="Read the driver date in Device Manager > Display "
                         "adapters > Driver, and compare it with the GPU "
                         "maker's site.")
+    names = " ".join(r["name"].upper() for r in clean)
+    discrete = any(m in names for m in GPU_DISCRETE_MARKERS)
+    integrated_only = (not discrete
+                       and any(m in names for m in GPU_INTEGRATED_MARKERS))
     status = "Warn" if newest > GPU_DRIVER_MAX_DAYS else "Pass"
     if status == "Warn":
         lines.append("newest driver is %d day(s) old, past this tool's "
                      "allowance" % newest)
+    if integrated_only:
+        status = "Warn"
+        lines.append("no discrete GPU: only an integrated adapter is present, "
+                     "where Esri recommends a discrete one")
     return dict(
         cid="PF-29", category="Hardware", status=status, title=title,
         observed=lines, expected=expected,
         impact="S2 and S4. A stale driver is the first thing Esri's own "
                "troubleshooting guide asks about, and on this list it is the "
-               "one that presents as a crash rather than as a slowdown.",
+               "one that presents as a crash rather than as a slowdown. An "
+               "integrated-only adapter is below Esri's published "
+               "recommendation of a discrete GPU: it runs, but visualisation "
+               "and 3D views pay for it, and on a notebook the integrated "
+               "chip also borrows from system RAM (PF-12).",
         fix="Update the driver from the GPU maker's own site - NVIDIA, AMD or "
             "Intel - not from Windows Update, which often carries an older "
-            "one. On a laptop, take it from the laptop maker. If crashes "
-            "began right after a driver update, roll that update back: it is "
-            "a known cause, and rolling back is a legitimate fix rather than "
-            "a step backwards.",
+            "one; Esri's own requirement page says plainly to use the latest "
+            "available driver. On a laptop, take it from the laptop maker. If "
+            "crashes began right after a driver update, roll that update "
+            "back: it is a known cause, and rolling back is a legitimate fix "
+            "rather than a step backwards. If the only adapter is integrated, "
+            "Esri recommends a discrete GPU with %d GB or more of dedicated "
+            "memory; failing that, raise system RAM to compensate for the "
+            "shared memory, and pin ArcGISPro.exe to the best adapter "
+            "available (PF-11)." % ESRI_GPU_VRAM_REC_GB,
         kpi={"driver_age_days": newest})
 
 
@@ -6459,6 +6538,49 @@ def self_test():
     check(decide_data_weight([big])["kpi"]["largest_gdb_gib"] == 40.0,
           "the heaviest geodatabase is carried as a number so the report can "
           "gauge it")
+
+    check(decide_cpu([{"name": "Celeron", "cores": 1, "logical": 2,
+                       "mhz": 1100}], None)["status"] == "Fail",
+          "one core is below Esri's published minimum of two and is a Fail, "
+          "not a Warn: Pro will not run properly on it")
+    check(decide_cpu([{"name": "i5", "cores": 2, "logical": 4,
+                       "mhz": 1608}], None)["status"] == "Warn",
+          "two cores with hyperthreading is Esri's bare MINIMUM, and it is a "
+          "Warn: grading on logical processors would have passed it as if it "
+          "met the four-core recommendation  <-- pinned defect")
+    check(decide_cpu([{"name": "i7", "cores": 4, "logical": 8,
+                       "mhz": 2800}], None)["status"] == "Pass",
+          "four cores meets Esri's published recommendation and passes")
+    check("Esri" in decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                                 "mhz": 2304}], None)["expected"],
+          "the CPU check names Esri as the source of its tiers rather than "
+          "presenting a number this tool chose as if Esri published it")
+
+    only_int = decide_gpu([{"name": "Intel(R) UHD Graphics 620",
+                            "driver": "31.0", "date": "2023-10-01"}],
+                          None, 1700000000.0)
+    check(only_int["status"] == "Warn"
+          and "discrete" in " ".join(only_int["observed"]),
+          "a recent driver on an integrated-only adapter still warns: Esri "
+          "recommends a discrete GPU, and a fresh driver does not change the "
+          "silicon  <-- pinned defect")
+    check(decide_gpu([{"name": "Intel(R) UHD Graphics 620", "driver": "31.0",
+                       "date": "2023-10-01"},
+                      {"name": "NVIDIA GeForce RTX 3060", "driver": "31.0",
+                       "date": "2023-10-01"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "and an integrated chip beside a discrete one is fine: pinning Pro "
+          "to the discrete card (PF-11) is the fix, not a hardware complaint")
+    check("Esri" in decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                                 "driver": "31.0", "date": "2023-10-01"}],
+                               None, 1700000000.0)["expected"],
+          "the GPU check quotes Esri's own 'use the latest available driver' "
+          "instead of only this tool's day count")
+    check(any("arcgis-pro-system-requirements" in u
+              for pairs in SOURCES.values() for _l, u in pairs),
+          "Esri's published system-requirements page is cited in the report, "
+          "so the numbers a reader is asked to compare against can be "
+          "checked  <-- pinned defect")
 
     registered = set(cid for cid, _c, _t, _d, _p
                      in registrations(FakeEnv(), {}, {}))

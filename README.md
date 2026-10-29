@@ -220,7 +220,7 @@ exercises the reading layer itself against a real temporary directory and a real
 and runs the whole tool once, read-only, on the machine you run it on. That run is captured, not
 printed.
 
-The same 743 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
+The same 751 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
 labels. That matters more than it sounds: the path logic answers questions about Windows paths,
 and two of the bugs it pins are cases where the standard library answers for the host instead of
 for the path. The reads that only exist on Windows are run twice, once with the platform switched
@@ -558,7 +558,7 @@ it was.
 
 ```
 python tests/test_toolbox.py      # 92 assertions over the renderer, the glue and the built .pyt
-python arcgis_pro_performance_analyser.py --self-test   # 743 assertions over the diagnostic
+python arcgis_pro_performance_analyser.py --self-test   # 751 assertions over the diagnostic
 python build_toolbox.py --check   # the shipped .pyt is what its three sources build to
 ```
 
