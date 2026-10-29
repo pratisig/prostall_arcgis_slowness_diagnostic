@@ -271,10 +271,25 @@ check('<nav class="toc">' in page and 'href="#perte-donnees"' in page
     "the page opens with a sommaire that reaches both blocks")
 check("Content-Security-Policy" in page,
     "the page ships a CSP that allows no external source at all")
-check('src="http' not in page and 'href="http' not in page
-      and "@import" not in page and "url(" not in page.split("<style>")[1].split("</style>")[0],
-      "no stylesheet, script, font or image is fetched from a host: the "
+check('src="http' not in page and "@import" not in page
+      and not re.search(r'<link[^>]+href="https?://', page)
+      and not re.search(r'<script[^>]+src="https?://', page)
+      and "url(" not in page.split("<style>")[1].split("</style>")[0],
+      "no stylesheet, script, font or image is FETCHED from a host: the "
       "report opens on a workstation that may be offline or air-gapped")
+links = re.findall(r'<a href="(https?://[^"]*)"', page)
+check(all(u.startswith("https://") for u in links) and len(links) > 20,
+      "the only external references left are the remediation source links, "
+      "and every one of them is https")
+check(all(" " not in u and "<" not in u and '"' not in u for u in links),
+      "no source URL carries a space or a character that would break out of "
+      "the href attribute")
+check(page.count('rel="noopener noreferrer"') == len(links),
+      "every source link is opened without handing the target page a handle "
+      "on the report")
+check(page.count('class="srclist"') > 20,
+      "the sources are printed per check, inside the check that cites them, "
+      "rather than collected in one footnote nobody reads")
 check(all(k in page for k in ("Fail", "Warn", "Pass", "Info", "Skipped")),
     "all five statuses have a legend entry on the page")
 check("ArcGIS Pro 3.4" not in page,
@@ -455,15 +470,20 @@ print("-" * 70)
 print("the .pyt loads and its tools are what ArcGIS Pro will see")
 pyt = load_pyt()
 box = pyt.Toolbox()
-check(box.alias == "properf" and len(box.tools) == 2,
-      "the toolbox exposes two tools under one alias")
+check(box.alias == "properf" and len(box.tools) == 1,
+      "the toolbox exposes exactly one tool: the offline self-test was "
+      "dropped from the pane because a second tool that is not a "
+      "diagnostic of the workstation only invites the wrong one to be "
+      "run. It stays on the command line as --self-test")
 check(box.canRunInBackground is False,
       "neither runs in the background: the diagnostic reads the session it "
       "runs in, and DL-12 asks whether Pro is open")
 diagnose = pyt.Diagnose()
-verify = pyt.VerifyAnalyser()
-check(diagnose.canRunInBackground is False and verify.canRunInBackground is False,
-      "and each tool says so itself")
+check(diagnose.canRunInBackground is False,
+      "and the tool says so itself")
+check(not hasattr(pyt, "VerifyAnalyser"),
+      "and the self-test tool is gone from the shipped file, not merely "
+      "hidden from the list")
 params = diagnose.getParameterInfo()
 names = [p.name for p in params]
 check(names == ["output_folder", "sde_server", "sde_port", "portal", "timeout",
@@ -491,10 +511,19 @@ check("Laissez vide" in (params[1].parameterHelp or "")
       "both network probes say what leaving them empty does, because "
       "empty is the right answer for most runs and a blank box "
       "otherwise reads as something forgotten")
-check("Rien n'est supprime" in (params[8].parameterHelp or "")
+check("Rien n'est supprimé" in (params[8].parameterHelp or "")
       and "annulation" in (params[8].parameterHelp or ""),
       "the one parameter that changes the machine says so, says nothing "
       "is deleted, and says an undo is printed")
+check(any(ord(c) > 127 for c in "".join(
+          (par.helpMessage or "") + (par.parameterHelp or "") for par in params)),
+      "the parameter help is written in accented French, not in French with "
+      "the accents stripped out: an unaccented paragraph reads as a machine "
+      "translation and the editor stops trusting the rest of the report")
+check(all("À quoi ça sert" in (par.parameterHelp or "") for par in params),
+      "every parameter opens by saying what it is FOR, before its default and "
+      "its example - the editor is not a specialist and should not have to "
+      "guess from the display name")
 
 print("-" * 70)
 print("the toolbox refuses what the analyser's parser refuses")
@@ -610,27 +639,6 @@ try:
           "only the messages can tell a lost-edits finding from a clean run")
     check(any(l.startswith("APPLIED") for l in m4.warn) is False,
           "and still nothing was applied, with the fixes unticked")
-finally:
-    shutil.rmtree(folder, ignore_errors=True)
-
-print("-" * 70)
-print("the self-test tool drives the analyser's own assertions")
-folder = tempfile.mkdtemp()
-try:
-    v = pyt.VerifyAnalyser()
-    vp = v.getParameterInfo()
-    vm = _Messages()
-    buffer = io.StringIO()
-    real = sys.stdout
-    sys.stdout = buffer
-    try:
-        v.execute(vp, vm)
-    finally:
-        sys.stdout = real
-    check("0 failed" in (vp[0].value or ""),
-          "the self-test tool reports the analyser's own assertion count: %s"
-          % vp[0].value)
-    check(not vm.err, "and no assertion failed")
 finally:
     shutil.rmtree(folder, ignore_errors=True)
 

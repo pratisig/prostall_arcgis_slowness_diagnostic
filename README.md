@@ -220,7 +220,7 @@ exercises the reading layer itself against a real temporary directory and a real
 and runs the whole tool once, read-only, on the machine you run it on. That run is captured, not
 printed.
 
-The same 710 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
+The same 751 assertions pass on Windows (Python 3.13) and on Linux (Python 3.12), with identical
 labels. That matters more than it sounds: the path logic answers questions about Windows paths,
 and two of the bugs it pins are cases where the standard library answers for the host instead of
 for the path. The reads that only exist on Windows are run twice, once with the platform switched
@@ -291,7 +291,7 @@ credential.
 
 ## What it checks
 
-Thirty-six checks. The thirteen that bear on lost edits run first and print first, because
+Thirty-nine checks. The thirteen that bear on lost edits run first and print first, because
 silent edit loss outranks every performance finding.
 
 **Data loss**, in the order they run and print.
@@ -498,15 +498,15 @@ missing on the machine it lands on.
 
 | File | What it is |
 |---|---|
-| `ArcGISPro_PerformanceAnalyser/ArcGISPro_PerformanceAnalyser.pyt` | **The shipped artefact.** Two tools, with the engine and the renderer inlined |
+| `ArcGISPro_PerformanceAnalyser/ArcGISPro_PerformanceAnalyser.pyt` | **The shipped artefact.** One tool, with the engine and the renderer inlined |
 | `arcgis_pro_performance_analyser.py` | The diagnostic engine and CLI. A single file, no `arcpy` import |
 | `html_report.py` | The HTML renderer. A pure function over the report document, no `arcpy` |
 | `toolbox_glue.py` | The ArcGIS Pro glue. The only part that imports `arcpy` |
 | `build_toolbox.py` | Assembles those three into the one `.pyt` |
-| `tests/test_toolbox.py` | 87 assertions over all of it, on a stand-in `arcpy` |
+| `tests/test_toolbox.py` | 92 assertions over all of it, on a stand-in `arcpy` |
 
 Install by copying that one `.pyt` anywhere stable, then Catalog pane > Toolboxes > Add Toolbox,
-pointing at it. The two tools appear under "ArcGIS Pro Performance Analyser".
+pointing at it. The tool appears under "ArcGIS Pro Performance Analyser".
 
 The `.pyt` is generated: **edit the sources and run `python build_toolbox.py`**, never the `.pyt`
 itself. `tests/test_toolbox.py` runs the build and compares the result byte for byte, so an
@@ -557,8 +557,8 @@ workstation report minus the project-file checks. For the full set, close Pro an
 it was.
 
 ```
-python tests/test_toolbox.py      # 87 assertions over the renderer, the glue and the built .pyt
-python arcgis_pro_performance_analyser.py --self-test   # 710 assertions over the diagnostic
+python tests/test_toolbox.py      # 92 assertions over the renderer, the glue and the built .pyt
+python arcgis_pro_performance_analyser.py --self-test   # 751 assertions over the diagnostic
 python build_toolbox.py --check   # the shipped .pyt is what its three sources build to
 ```
 

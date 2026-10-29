@@ -46,16 +46,16 @@ applied change prints its own undo command, and nothing deletes anything.
 
 Provenance
 ----------
-  arcgis_pro_performance_analyser.py        7936 lines  sha256:8739cf873d56
-  html_report.py                             874 lines  sha256:55de8bc2d7fc
-  toolbox_glue.py                            533 lines  sha256:238f270b063c
+  arcgis_pro_performance_analyser.py        8754 lines  sha256:801b6e898dfb
+  html_report.py                             890 lines  sha256:beb3f3098f4f
+  toolbox_glue.py                            510 lines  sha256:081b144a742d
 """
 
 from __future__ import print_function
 
 # ============================================================================
 # 1/3  diagnostic engine
-# source: arcgis_pro_performance_analyser.py  (sha256:8739cf873d56)
+# source: arcgis_pro_performance_analyser.py  (sha256:801b6e898dfb)
 # ----------------------------------------------------------------------------
 # r"""Diagnose why ArcGIS Pro is slow on this workstation, and never report a finding the machine did not produce.
 #
@@ -97,6 +97,7 @@ from __future__ import print_function
 
 
 import argparse
+import calendar
 import collections
 import json
 import ntpath
@@ -214,6 +215,155 @@ LINK_SPEED_MIN_MBPS = 1000
 # on a machine that is already near its memory ceiling, and a pagefile on a
 # network volume is a stall nobody will find in the Pro logs.
 PAGEFILE_MIN_MB = 4096
+
+# ---------------------------------------------------------------------------
+# Esri's PUBLISHED ArcGIS Pro system requirements, read off the official pages
+# (3.6 English and 3.7 French, both opened). These are Esri's figures, quoted,
+# and the report says whose figures they are. Everything else in this file is
+# an allowance this tool chose for itself, and says so.
+#
+#   https://doc.esri.com/fr/arcgis-pro/latest/get-started/
+#       arcgis-pro-system-requirements.html
+#   https://pro.arcgis.com/en/pro-app/3.6/get-started/
+#       arcgis-pro-system-requirements.htm
+# ---------------------------------------------------------------------------
+ESRI_CPU_MIN_CORES = 2         # minimum, with simultaneous multithreading
+ESRI_CPU_REC_CORES = 4         # recommended
+ESRI_CPU_OPT_CORES = 10        # optimal
+ESRI_RAM_MIN_GB = 8.0
+ESRI_RAM_REC_GB = 32.0
+ESRI_RAM_OPT_GB = 64.0
+ESRI_FREE_DISK_GB = 32.0       # minimum free, and on an SSD when recommended
+ESRI_VIZ_CACHE_GB = 32.0       # the visualization cache alone may take this
+ESRI_GPU_VRAM_REC_GB = 8.0     # dedicated, not shared
+
+GPU_DRIVER_MAX_DAYS = 365      # past a year, "update the driver" is the answer
+# Esri's own performance readout names WARP explicitly: it means Pro found no
+# capable GPU and is emulating one on the CPU, which is slow by construction.
+GPU_EMULATED_MARKERS = ("WARP", "BASIC DISPLAY", "MICROSOFT BASIC")
+# Esri recommends "a discrete (not integrated) GPU that is supported by the
+# manufacturer". A machine whose only adapter is integrated is below that
+# recommendation, which is a Warn and not a fault: it works, it just draws
+# slower, and on a notebook it is often the only option there is.
+GPU_INTEGRATED_MARKERS = ("INTEL UHD", "INTEL HD", "INTEL IRIS",
+                          "INTEL(R) HD", "INTEL(R) UHD", "INTEL(R) IRIS",
+                          "AMD RADEON(TM) GRAPHICS", "RADEON RX VEGA 8",
+                          "RADEON RX VEGA 11", "VEGA 8", "VEGA 11",
+                          "MICROSOFT BASIC")
+GPU_DISCRETE_MARKERS = ("GEFORCE", "RTX", "GTX", "QUADRO", "RTX PRO",
+                        "RADEON PRO", "RADEON RX", "TITAN", "ARC A")
+
+# Data folder weight. Measured by walking the folder a recent project lives
+# in, never by opening the .aprx: this check has to keep answering from inside
+# ArcGIS Pro, where the project-file checks are refused on purpose.
+DATA_SCAN_DEPTH = 4
+DATA_SCAN_LIMIT = 20000
+DATA_GDB_WARN_BYTES = 10 * 1024 * 1024 * 1024   # 10 GiB in one file geodatabase
+DATA_FILES_WARN = 5000        # file COUNT matters for a synced folder, not size
+
+# ---------------------------------------------------------------------------
+# SOURCES. Where each remediation comes from.
+#
+# Every URL here was actually opened, either with the fetch tool or through a
+# search result, before it was written down. A check with no honest source is
+# simply absent from this map and the report prints no Sources block for it:
+# inventing a citation to make a row look supported is worse than an empty row.
+# ---------------------------------------------------------------------------
+
+_ESRI_PERF = ("Esri - R&eacute;glages qui influent sur les performances "
+              "d'acc&eacute;s aux donn&eacute;es",
+              "https://doc.esri.com/en/arcgis-pro/latest/get-started/"
+              "layer-map-project-perf-optimization.html")
+_ESRI_TROUBLE = ("Esri - D&eacute;pannage des probl&egrave;mes de performance "
+                 "dans ArcGIS Pro",
+                 "https://community.esri.com/t5/arcgis-pro-documents/"
+                 "troubleshooting-performance-issues-in-arcgis-pro/ta-p/"
+                 "1025516")
+_ESRI_3D = ("Esri - FPS, Tri/Sec, MemMb et l'affichage WARP",
+            "https://www.esri.com/arcgis-blog/products/3d-gis/3d-gis/"
+            "troubleshooting-performance-issues-in-arcgis-pro")
+_ESRI_CACHE = ("Esri - Rendu lent : vider le cache de l'espace de travail",
+               "https://support.esri.com/en-us/knowledge-base/problem-convert-"
+               "labels-to-graphics-renders-slowly-in-ar-000034620")
+_ESRI_CA = ("Esri Canada - D&eacute;panner ArcGIS Pro comme un analyste du "
+            "support", "https://resources.esri.ca/getting-technical/"
+            "troubleshooting-arcgis-pro-like-an-esri-canada-support-analyst-"
+            "part-1")
+_ESRI_PROJ = ("Esri Community - Vitesse d'un projet ArcGIS Pro",
+              "https://community.esri.com/t5/arcgis-utility-network-questions/"
+              "arcgis-pro-project-speed/td-p/1581320")
+_ESRI_REQ = ("Esri - Configuration syst\u00e8me requise pour ArcGIS Pro "
+             "(chiffres publi\u00e9s : minimum, recommand\u00e9, optimal)",
+             "https://doc.esri.com/fr/arcgis-pro/latest/get-started/"
+             "arcgis-pro-system-requirements.html")
+_MS_NIC = ("Microsoft - MSFT_NetAdapterPowerManagementSettingData",
+           "https://learn.microsoft.com/en-us/previous-versions/windows/"
+           "desktop/legacy/hh872363(v=vs.85)")
+_R_SINGLE = ("r/gis - Pro est mono-thread : 16 c\u0153urs n'y changent rien",
+             "https://www.reddit.com/r/gis/comments/t7lc3h/not_being_funny_"
+             "is_there_an_actual_reason_arcgis/")
+_R_ONEDRIVE = ("r/ArcGIS - OneDrive et les fichiers SIG : 10 min pour ouvrir "
+               "un projet", "https://www.reddit.com/r/ArcGIS/comments/"
+               "1srr0qm/one_drive_and_gis_files_question/")
+_R_ONEDRIVE2 = ("r/ArcGIS - OneDrive en \u00ab Pending \u00bb pendant un "
+                "traitement", "https://www.reddit.com/r/ArcGIS/comments/"
+                "1kix8v8/how_much_time_is_likely_left_on_this_process/")
+_R_EDITSLOW = ("r/ArcGIS - Pro ralentit \u00e0 chaque modification : "
+               "indexation, NAS, projection",
+               "https://www.reddit.com/r/ArcGIS/comments/1ni4key/"
+               "arcgis_pro_slowing_down_with_each_edit/")
+_R_CRASH = ("r/gis - Pro plante sur les gros jeux de donn&eacute;es",
+            "https://www.reddit.com/r/gis/comments/htmscu/arcgis_pro_"
+            "crashing_when_editing_large_data_sets/")
+_R_SLOWMAP = ("r/ArcGIS - Carte lente \u00e0 charger : 28 Go de JPEG "
+              "g&eacute;or&eacute;f&eacute;renc&eacute;s",
+              "https://www.reddit.com/r/ArcGIS/comments/1v82j68/"
+              "arcgis_pro_slow_loading_map/")
+_R_SHUTS = ("r/gis - \u00ab it just shuts with no warning and no saving \u00bb",
+            "https://www.reddit.com/r/gis/comments/940cyk/arcgis_pro_"
+            "performance_impressions/")
+
+SOURCES = {
+    "DL-03": [_ESRI_PROJ],
+    "DL-04": [_MS_NIC],
+    "DL-05": [_ESRI_REQ, _R_ONEDRIVE, _R_ONEDRIVE2],
+    "DL-06": [_ESRI_REQ, _R_ONEDRIVE2, _R_ONEDRIVE],
+    "DL-07": [_ESRI_REQ, _R_ONEDRIVE],
+    "DL-08": [_R_ONEDRIVE],
+    "DL-09": [_ESRI_TROUBLE],
+    "DL-10": [_ESRI_PERF],
+    "DL-11": [_ESRI_PERF],
+    "DL-12": [_ESRI_TROUBLE],
+    "DL-13": [_R_SHUTS, _ESRI_3D],
+    "PF-01": [_ESRI_PERF, _R_EDITSLOW],
+    "PF-02": [_ESRI_PROJ],
+    "PF-03": [_ESRI_CACHE],
+    "PF-04": [_ESRI_TROUBLE],
+    "PF-05": [_ESRI_TROUBLE, _ESRI_3D],
+    "PF-06": [_ESRI_TROUBLE, _ESRI_CACHE, _ESRI_REQ],
+    "PF-07": [_ESRI_PROJ],
+    "PF-08": [_ESRI_TROUBLE, _R_EDITSLOW, _ESRI_PROJ],
+    "PF-09": [_ESRI_CACHE, _R_CRASH, _R_SLOWMAP],
+    "PF-10": [_ESRI_TROUBLE, _ESRI_PROJ],
+    "PF-11": [_ESRI_TROUBLE, _ESRI_3D, _ESRI_CA, _ESRI_REQ],
+    "PF-12": [_ESRI_REQ, _ESRI_PROJ, _R_CRASH, _R_EDITSLOW],
+    "PF-13": [_ESRI_REQ, _ESRI_PROJ],
+    "PF-14": [_ESRI_PERF],
+    "PF-15": [_ESRI_CA],
+    "PF-16": [_R_SLOWMAP, _ESRI_PERF],
+    "PF-17": [_ESRI_TROUBLE],
+    "PF-18": [_ESRI_REQ, _R_EDITSLOW, _ESRI_CA],
+    "PF-19": [_ESRI_PERF],
+    "PF-20": [_ESRI_PROJ],
+    "PF-21": [_ESRI_CACHE],
+    "PF-22": [_ESRI_PERF],
+    "PF-26": [_ESRI_PROJ],
+    "PF-27": [_ESRI_PERF, _ESRI_3D],
+    "PF-28": [_ESRI_REQ, _R_SINGLE, _ESRI_CA],
+    "PF-29": [_ESRI_REQ, _ESRI_TROUBLE, _ESRI_3D],
+    "PF-30": [_R_CRASH, _R_ONEDRIVE, _R_SLOWMAP],
+}
+
 
 # One directory listing on the project share. These are this tool's
 # allowances, not a published figure: Pro lists folders many times while it
@@ -1370,7 +1520,13 @@ def decide_memory(total_gb, free_gb):
             observed="Installed and free memory could not be read on this "
                      "platform, so no verdict is given. This is a failed read, "
                      "not a hardware finding.",
-            expected="At least %.0f GB for enterprise editing." % MIN_MEMORY_GB,
+            expected="Esri's published requirement: minimum %.0f GB, recommended "
+                     "%.0f GB, optimal %.0f GB or more. This tool warns "
+                     "below %.0f GB, its own allowance for enterprise "
+                     "editing, which sits between Esri's minimum and "
+                     "recommended figures."
+                     % (ESRI_RAM_MIN_GB, ESRI_RAM_REC_GB, ESRI_RAM_OPT_GB,
+                        MIN_MEMORY_GB),
             impact="S1 and S2 undetermined.",
             fix="Read it by hand from Task Manager and re-run.")
     if total_gb < MIN_MEMORY_GB:
@@ -1404,8 +1560,12 @@ def decide_disk(volumes):
             title="Free disk space",
             observed="No volume could be read, so free space was not measured "
                      "this run.",
-            expected="At least %.0f GB and %.0f%% free."
-                     % (MIN_FREE_DISK_GB, MIN_FREE_DISK_PCT),
+            expected="Esri's published requirement is %.0f GB of free space, on an "
+                     "SSD when recommended; the visualization cache alone "
+                     "may take up to %.0f GB. This tool fails below %.0f GB "
+                     "or %.0f%% free, its own lower allowance."
+                     % (ESRI_FREE_DISK_GB, ESRI_VIZ_CACHE_GB,
+                        MIN_FREE_DISK_GB, MIN_FREE_DISK_PCT),
             impact="S1 and S2 undetermined.",
             fix="Read it by hand and re-run.")
     lines = []
@@ -2750,6 +2910,46 @@ class Env(object):
             "[string]$_.LinkSpeed} }); ConvertTo-Json -Compress -InputObject $a")
         return _ps_rows(data, "name", "speed"), error
 
+    def cpu(self):
+        """([processor rows], None) or (None, reason).
+
+        One row per socket. ArcGIS Pro draws largely on one core, so the clock
+        of a single core matters more than the count of them; both are read
+        because a low count starves parallel geoprocessing instead.
+        """
+        if not self.windows:
+            return None, "the processor is read on Windows only"
+        data, error = self._powershell_json(
+            "$p = @(Get-CimInstance Win32_Processor | ForEach-Object { "
+            "[pscustomobject]@{name = $_.Name; cores = $_.NumberOfCores; "
+            "logical = $_.NumberOfLogicalProcessors; mhz = "
+            "$_.MaxClockSpeed} }); ConvertTo-Json -Compress -InputObject $p")
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            data = [data]
+        return [row for row in data if isinstance(row, dict)], None
+
+    def gpu(self):
+        """([video controller rows], None) or (None, reason).
+
+        The driver date is the finding, not the adapter name: the first thing
+        Esri's own troubleshooting guide asks for is a driver from the GPU
+        maker rather than the one Windows Update offered.
+        """
+        if not self.windows:
+            return None, "the graphics adapter is read on Windows only"
+        data, error = self._powershell_json(
+            "$g = @(Get-CimInstance Win32_VideoController | ForEach-Object { "
+            "[pscustomobject]@{name = $_.Name; driver = $_.DriverVersion; "
+            "date = $(if ($_.DriverDate) { $_.DriverDate.ToString('o') } "
+            "else { $null })} }); ConvertTo-Json -Compress -InputObject $g")
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            data = [data]
+        return [row for row in data if isinstance(row, dict)], None
+
     def pagefile(self):
         """([entries], None) or (None, reason) from the boot-time setting.
 
@@ -3521,6 +3721,401 @@ def probe_overviews(env, facts):
     return decide_overviews(rasters, with_overview, unreadable)
 
 
+def _int_or_none(value):
+    """An int out of one CIM answer, or None. A bool is not a count."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _cpu_row(row):
+    """One processor row coerced, or None when it carries nothing usable."""
+    name = row.get("name")
+    cores = _int_or_none(row.get("cores"))
+    logical = _int_or_none(row.get("logical"))
+    mhz = _int_or_none(row.get("mhz"))
+    if name is None and cores is None and logical is None and mhz is None:
+        return None
+    return {"name": "%s" % (name or "<unnamed processor>"),
+            "cores": cores or 0, "logical": logical or 0, "mhz": mhz or 0}
+
+
+def _driver_age_days(text, now):
+    """Days since a driver date, or None.
+
+    A date that cannot be parsed answers None, never zero: a driver with an
+    unreadable date is not a driver installed today, and reading it as fresh
+    would pass the one check Esri's guide leads with.
+    """
+    if not text:
+        return None
+    try:
+        stamp = calendar.timegm(time.strptime("%s" % text[:10], "%Y-%m-%d"))
+    except (ValueError, OverflowError, TypeError):
+        return None
+    if stamp > now:
+        return None
+    return int((now - stamp) / 86400)
+
+
+def _gpu_row(row, now):
+    """One video controller coerced, or None when it carries nothing usable."""
+    name = row.get("name")
+    driver = row.get("driver")
+    date = row.get("date")
+    if name is None and driver is None and date is None:
+        return None
+    return {"name": "%s" % (name or "<unnamed adapter>"),
+            "driver": "%s" % (driver or "<version not reported>"),
+            "date": date or None,
+            "age_days": _driver_age_days(date, now)}
+
+
+def decide_cpu(rows, error):
+    """PF-28. What the processor is.
+
+    The second machine finding no ArcGIS Pro setting fixes, after the disk.
+    Pro draws largely on one core, so a weak single-core clock reads as an
+    unexplained stall while every setting in the report is correct.
+    """
+    title = "Processor model, cores and clock"
+    expected = ("Esri's published requirement: minimum %d cores with "
+                "simultaneous multithreading, recommended %d cores, optimal "
+                "%d cores."
+                % (ESRI_CPU_MIN_CORES, ESRI_CPU_REC_CORES, ESRI_CPU_OPT_CORES))
+    if error:
+        return dict(cid="PF-28", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The processor could not be read: %s. An unread "
+                             "processor is not a processor that is fine."
+                             % error,
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_Processor | "
+                        "Select Name, NumberOfCores, NumberOfLogicalProcessors, "
+                        "MaxClockSpeed.")
+    clean = [r for r in [_cpu_row(x) for x in rows] if r]
+    if not clean:
+        return dict(cid="PF-28", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The processor list came back empty, so nothing "
+                             "was read.",
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_Processor.")
+    logical = sum(r["logical"] for r in clean)
+    cores = sum(r["cores"] for r in clean)
+    clocks = [r["mhz"] for r in clean if r["mhz"]]
+    mhz = max(clocks) if clocks else 0
+    lines = ["%s: %d core(s), %d logical, %s"
+             % (r["name"], r["cores"], r["logical"],
+                ("%.2f GHz" % (r["mhz"] / 1000.0)) if r["mhz"]
+                else "<clock not reported>") for r in clean]
+    lines.append("totals: %d core(s), %d logical processor(s)"
+                 % (cores, logical))
+    # Graded on CORES, because that is what Esri counts. Grading on logical
+    # processors would read a 2-core/4-thread chip - Esri's bare minimum - as
+    # if it met the 4-core recommendation.
+    if cores < ESRI_CPU_MIN_CORES:
+        status = "Fail"
+        lines.append("fewer cores than Esri's published minimum of %d"
+                     % ESRI_CPU_MIN_CORES)
+    elif cores < ESRI_CPU_REC_CORES:
+        status = "Warn"
+        lines.append("at Esri's published minimum of %d cores, below the "
+                     "recommended %d" % (ESRI_CPU_MIN_CORES,
+                                         ESRI_CPU_REC_CORES))
+    else:
+        status = "Pass"
+    return dict(
+        cid="PF-28", category="Hardware", status=status, title=title,
+        observed=lines, expected=expected,
+        impact="S1 and S2. ArcGIS Pro draws largely on one core, so a weak "
+               "single-core clock shows up as a stall no setting explains; "
+               "the core count starves parallel geoprocessing instead. Esri "
+               "counts cores, not threads, so a chip reporting four logical "
+               "processors may still be a two-core part.",
+        fix="Hardware is not configurable, so act on what is: close other "
+            "applications before a heavy session, set the power plan to High "
+            "performance (PF-15), and pin ArcGISPro.exe to the "
+            "high-performance GPU (PF-11). Esri's published tiers are %d "
+            "cores minimum, %d recommended, %d optimal; when specifying a "
+            "machine, favour single-core clock over core count, and note that "
+            "some geoprocessing tools need an AVX-capable processor and the "
+            "geoprocessing tool search needs AVX2."
+            % (ESRI_CPU_MIN_CORES, ESRI_CPU_REC_CORES, ESRI_CPU_OPT_CORES),
+        kpi={"cores": cores, "logical": logical,
+             "max_ghz": round(mhz / 1000.0, 2)})
+
+
+def decide_gpu(rows, error, now):
+    """PF-29. The graphics adapter and how old its driver is.
+
+    Updating the driver from the GPU maker is the first thing Esri's own
+    troubleshooting guide asks for, and it is the one cause on this list that
+    presents as a crash rather than as a slowdown.
+    """
+    title = "Graphics adapter and driver age"
+    expected = ("Esri recommends a discrete - not integrated - GPU supported "
+                "by its manufacturer, with %d GB or more of dedicated "
+                "graphics memory, and says to use the latest available "
+                "driver. The %d-day age limit is this tool's own reading of "
+                "that instruction."
+                % (ESRI_GPU_VRAM_REC_GB, GPU_DRIVER_MAX_DAYS))
+    if error:
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The graphics adapter could not be read: %s. An "
+                             "unread adapter is not an adapter that is fine."
+                             % error,
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_VideoController "
+                        "| Select Name, DriverVersion, DriverDate.")
+    clean = [r for r in [_gpu_row(x, now) for x in rows] if r]
+    if not clean:
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title,
+                    observed="The adapter list came back empty, so nothing was "
+                             "read.",
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read it by hand: Get-CimInstance Win32_VideoController.")
+    lines = ["%s: driver %s, dated %s"
+             % (r["name"], r["driver"],
+                ("%d day(s) old" % r["age_days"]) if r["age_days"] is not None
+                else "<date not readable>") for r in clean]
+    emulated = [r for r in clean
+                if any(m in r["name"].upper() for m in GPU_EMULATED_MARKERS)]
+    if emulated:
+        lines.append("emulated on the CPU: %s"
+                     % ", ".join(r["name"] for r in emulated))
+        return dict(
+            cid="PF-29", category="Hardware", status="Fail", title=title,
+            observed=lines, expected=expected,
+            impact="S2 and S4. Pro found no capable GPU and is emulating one "
+                   "on the CPU, which is slow by construction and is the "
+                   "single most common cause of a session that hangs on draw.",
+            fix="Install the driver from the GPU maker's own site - NVIDIA, "
+                "AMD or Intel - not the one Windows Update offers. On a "
+                "laptop, take it from the laptop maker instead. Then pin "
+                "ArcGISPro.exe to that GPU (PF-11). If Pro still reports "
+                "WARP, the card or its driver does not support the required "
+                "capabilities and switching the rendering engine to OpenGL "
+                "(PF-05) is the next step.")
+    ages = [r["age_days"] for r in clean if r["age_days"] is not None]
+    newest = min(ages) if ages else None
+    if newest is None:
+        lines.append("no driver date could be read, so no age was computed")
+        return dict(cid="PF-29", category="Hardware", status="Info",
+                    measured=False, title=title, observed=lines,
+                    expected=expected, impact="S2 and S4 undetermined.",
+                    fix="Read the driver date in Device Manager > Display "
+                        "adapters > Driver, and compare it with the GPU "
+                        "maker's site.")
+    names = " ".join(r["name"].upper() for r in clean)
+    discrete = any(m in names for m in GPU_DISCRETE_MARKERS)
+    integrated_only = (not discrete
+                       and any(m in names for m in GPU_INTEGRATED_MARKERS))
+    status = "Warn" if newest > GPU_DRIVER_MAX_DAYS else "Pass"
+    if status == "Warn":
+        lines.append("newest driver is %d day(s) old, past this tool's "
+                     "allowance" % newest)
+    if integrated_only:
+        status = "Warn"
+        lines.append("no discrete GPU: only an integrated adapter is present, "
+                     "where Esri recommends a discrete one")
+    return dict(
+        cid="PF-29", category="Hardware", status=status, title=title,
+        observed=lines, expected=expected,
+        impact="S2 and S4. A stale driver is the first thing Esri's own "
+               "troubleshooting guide asks about, and on this list it is the "
+               "one that presents as a crash rather than as a slowdown. An "
+               "integrated-only adapter is below Esri's published "
+               "recommendation of a discrete GPU: it runs, but visualisation "
+               "and 3D views pay for it, and on a notebook the integrated "
+               "chip also borrows from system RAM (PF-12).",
+        fix="Update the driver from the GPU maker's own site - NVIDIA, AMD or "
+            "Intel - not from Windows Update, which often carries an older "
+            "one; Esri's own requirement page says plainly to use the latest "
+            "available driver. On a laptop, take it from the laptop maker. If "
+            "crashes began right after a driver update, roll that update "
+            "back: it is a known cause, and rolling back is a legitimate fix "
+            "rather than a step backwards. If the only adapter is integrated, "
+            "Esri recommends a discrete GPU with %d GB or more of dedicated "
+            "memory; failing that, raise system RAM to compensate for the "
+            "shared memory, and pin ArcGISPro.exe to the best adapter "
+            "available (PF-11)." % ESRI_GPU_VRAM_REC_GB,
+        kpi={"driver_age_days": newest})
+
+
+def _gdb_owner(path):
+    """The .gdb folder a path lives in, or None.
+
+    Split on both separators on purpose: the engine reads Windows paths on
+    whatever host it happens to run on, and os.path.split would not separate
+    a backslash path on Linux.
+    """
+    for part in re.split(r"[\\/]", path or ""):
+        if part.lower().endswith(".gdb"):
+            return part
+    return None
+
+
+def decide_data_weight(folders):
+    """PF-30. How heavy the data beside the project actually is.
+
+    Deliberately independent of the .aprx. PF-10 weighs the project file and
+    is refused whenever Pro is open, which is most of the time this tool is
+    used; a size that needs the project file open would be useless from
+    inside Pro. This one only stats files, so it answers either way.
+    """
+    title = "Data folder weight: geodatabases, rasters, file count"
+    expected = ("No single file geodatabase over %s, and fewer than %d files "
+                "in the folder the project lives in. Both thresholds are this "
+                "tool's own allowances, not published Esri figures."
+                % ("%d GiB" % (DATA_GDB_WARN_BYTES // (1024 * 1024 * 1024)),
+                   DATA_FILES_WARN))
+    if not folders:
+        return dict(
+            cid="PF-30", category="Storage", status="Info", measured=False,
+            title=title,
+            observed="No recent project was found, so there was no folder to "
+                     "weigh.",
+            expected=expected, impact="S1 and S2 undetermined.",
+            fix="Point the tool at the folder by hand: open the project's "
+                "folder in Explorer, right-click the .gdb, Properties. Or run "
+                "the command line with Pro closed so the recent list is read.")
+    lines = []
+    total = 0
+    files = 0
+    capped = False
+    unreadable = []
+    worst = None
+    for folder in folders:
+        total += folder.get("bytes", 0)
+        files += folder.get("files", 0)
+        capped = capped or folder.get("capped", False)
+        unreadable.extend(folder.get("unreadable") or [])
+        lines.append("%s: %d file(s), %s%s"
+                     % (folder.get("root", "<folder>"), folder.get("files", 0),
+                        format_bytes(folder.get("bytes", 0)),
+                        " (scan stopped early, so this is a floor)"
+                        if folder.get("capped") else ""))
+        for name, (gbytes, gfiles) in sorted(
+                (folder.get("gdbs") or {}).items(),
+                key=lambda kv: -kv[1][0]):
+            lines.append("    %s: %s in %d file(s)"
+                         % (name, format_bytes(gbytes), gfiles))
+            if worst is None or gbytes > worst[1]:
+                worst = (name, gbytes, folder.get("root", "<folder>"))
+    if unreadable:
+        lines.extend(["unreadable, so not counted: %s" % u
+                      for u in unreadable[:5]])
+        if len(unreadable) > 5:
+            lines.append("    ... %d more unreadable item(s)"
+                         % (len(unreadable) - 5))
+    lines.append("totals: %d file(s), %s%s"
+                 % (files, format_bytes(total),
+                    " (floor, the scan stopped early)" if capped else ""))
+
+    reasons = []
+    if worst and worst[1] >= DATA_GDB_WARN_BYTES:
+        reasons.append("a single file geodatabase holds %s"
+                       % format_bytes(worst[1]))
+    if files >= DATA_FILES_WARN:
+        reasons.append("%d files in the folder" % files)
+
+    if capped and not reasons:
+        # A scan that stopped early cannot prove the folder is small. Grading
+        # Pass here would be a verdict the walk did not produce.
+        lines.append("the scan stopped before the end, so a small total here "
+                     "proves nothing")
+        return dict(cid="PF-30", category="Storage", status="Info",
+                    measured=False, title=title, observed=lines,
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Weigh the folder by hand in Explorer, or narrow the "
+                        "scan by moving the biggest rasters out first.")
+    if not reasons:
+        return dict(
+            cid="PF-30", category="Storage", status="Pass", title=title,
+            observed=lines, expected=expected,
+            impact="No data-weight penalty found beside the project.",
+            kpi={"data_gib": round(total / float(1024 ** 3), 2),
+                 "data_files": files})
+    return dict(
+        cid="PF-30", category="Storage", status="Warn", title=title,
+        observed=lines, expected=expected,
+        impact="S1 and S2. A file geodatabase this heavy is slow to open and "
+               "to edit, and it is slowest of all on a network share or a "
+               "spinning disk. The file count matters on its own: a synced "
+               "folder has to track every file, so ten thousand small files "
+               "cost more to sync than one large geodatabase of the same "
+               "size.",
+        fix="Split the heaviest geodatabase by theme, or export only the area "
+            "you are editing into a small working geodatabase and append back "
+            "when done. Move it to a local SSD if it currently sits on a "
+            "network share or a spinning disk - that alone has fixed this for "
+            "people whose only symptom was a slowdown. Keep it out of any "
+            "synced folder: for data that must be shared, a mobile "
+            "geodatabase has far fewer files to sync than a file geodatabase. "
+            "Rebuild the attribute and spatial indexes after a large load.",
+        kpi={"data_gib": round(total / float(1024 ** 3), 2),
+             "data_files": files,
+             "largest_gdb_gib": round(worst[1] / float(1024 ** 3), 2)
+             if worst else 0.0})
+
+
+def probe_data_weight(env, facts):
+    """PF-30. Weigh the folders the recent projects live in.
+
+    Only os.stat and a bounded walk: the .aprx is never opened, so this keeps
+    answering while Pro holds the project open.
+    """
+    roots = []
+    seen = set()
+    for path, _when, _cls in (facts.get("recent") or []):
+        parent = ntpath.dirname("%s" % path).rstrip("\\/")
+        if parent and parent.lower() not in seen:
+            seen.add(parent.lower())
+            roots.append(parent)
+    folders = []
+    for root in roots[:APRX_MAX_PROJECTS]:
+        entries, unreadable = env.scan(root, depth=DATA_SCAN_DEPTH,
+                                       limit=DATA_SCAN_LIMIT)
+        gdbs = {}
+        total = 0
+        files = 0
+        for entry in entries:
+            if entry.isdir:
+                continue
+            total += entry.size
+            files += 1
+            owner = _gdb_owner(entry.path)
+            if owner:
+                gbytes, gfiles = gdbs.get(owner, (0, 0))
+                gdbs[owner] = (gbytes + entry.size, gfiles + 1)
+        folders.append({"root": root, "bytes": total, "files": files,
+                        "gdbs": gdbs, "unreadable": unreadable,
+                        "capped": len(entries) >= DATA_SCAN_LIMIT})
+    return decide_data_weight(folders)
+
+
+def probe_cpu(env, facts):
+    rows, error = env.cpu()
+    return decide_cpu(rows or [], error)
+
+
+def probe_gpu(env, facts):
+    rows, error = env.gpu()
+    return decide_gpu(rows or [], error, env.now())
+
+
 def probe_disk_media(env, facts):
     disks, error = env.disk_media()
     return decide_disk_media(disks or [], error)
@@ -4200,6 +4795,13 @@ def registrations(env, facts, opts):
          lambda: probe_roaming(env, facts)),
         ("PF-27", "Display", "Symbology refresh (S4)", False,
          lambda: probe_symbology(env, facts)),
+        ("PF-28", "Hardware", "Processor model, cores and clock", False,
+         lambda: probe_cpu(env, facts)),
+        ("PF-29", "Hardware", "Graphics adapter and driver age", False,
+         lambda: probe_gpu(env, facts)),
+        ("PF-30", "Storage", "Data folder weight: geodatabases, rasters, "
+                              "file count", False,
+         lambda: probe_data_weight(env, facts)),
     ]
 
 
@@ -4212,6 +4814,14 @@ def run_checks(env, opts):
         def body(target, probe=probe):
             add_check(target, **probe())
         safe_check(checks, cid, category, title, body, dataloss=dataloss)
+    for check in checks:
+        # Attached after the fact rather than passed through make_check: the
+        # source belongs to the check's id, not to what the machine said, so
+        # a check that could not be measured still carries its remediation
+        # references.
+        found = SOURCES.get(check.get("id"))
+        if found:
+            check["sources"] = [list(pair) for pair in found]
     return checks, facts
 
 
@@ -4654,6 +5264,13 @@ class FakeEnv(Env):
         data, error = self._answer("link_speed")
         return _ps_rows(data, "name", "speed"), error
 
+    def cpu(self):
+        return self._answer("cpu")
+
+    def gpu(self):
+        return self._answer("gpu")
+
+
     def events(self, log, query, count):
         return self._events.get(log, (None, "no such log on the stand-in "
                                             "machine"))
@@ -4844,6 +5461,11 @@ def fake_healthy():
             "disk_media": ([{"name": "SAMSUNG SSD 980 PRO", "media": "SSD"}],
                            None),
             "link_speed": ([{"name": "Ethernet", "speed": "1 Gbps"}], None),
+            "cpu": ([{"name": "Intel Core i7-11800H", "cores": 8,
+                      "logical": 16, "mhz": 2304}], None),
+            "gpu": ([{"name": "NVIDIA GeForce RTX 3060",
+                      "driver": "31.0.15.3623", "date": "2023-10-01"}],
+                    None),
             "smb": ({"EnableMultiChannel": True,
                      "RequireSecuritySignature": False,
                      "DirectoryCacheLifetime": 10,
@@ -4944,6 +5566,11 @@ def fake_sick():
             "link_speed": ([{"name": "Wi-Fi", "speed": "866 Mbps"},
                             {"name": "Ethernet 2", "speed": "100 Mbps"}],
                            None),
+            "cpu": ([{"name": "Intel Core i5-8250U", "cores": 2,
+                      "logical": 2, "mhz": 1608}], None),
+            "gpu": ([{"name": "Intel UHD Graphics 620",
+                      "driver": "27.20.100.8681", "date": "2022-01-10"}],
+                    None),
             "smb": ({"EnableMultiChannel": False,
                      "RequireSecuritySignature": True,
                      "DirectoryCacheLifetime": 10,
@@ -5800,6 +6427,195 @@ def self_test():
     check(decide_link_speed([], "access denied")["status"] == "Info",
           "and an unread adapter list is Info")
 
+    check(decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                       "mhz": 2304}], None)["status"] == "Pass",
+          "a sixteen-logical processor passes the allowance this tool sets")
+    check(decide_cpu([{"name": "i5", "cores": 2, "logical": 2,
+                       "mhz": 1608}], None)["status"] == "Warn",
+          "and two logical processors warn: Pro draws largely on one core, so "
+          "a weak clock reads as a stall no setting explains")
+    check(decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                       "mhz": 2304}], None)["kpi"]["logical"] == 16,
+          "the core count is carried as a number so the report can gauge it")
+    check(decide_cpu([{"name": None, "cores": None, "logical": None,
+                       "mhz": None}], None)["status"] == "Info",
+          "a processor row carrying nothing at all is Info, not a Pass on "
+          "zeroes  <-- pinned defect")
+    check(decide_cpu([], "access denied")["status"] == "Info"
+          and decide_cpu([], None)["status"] == "Info",
+          "an unread processor list and an empty one are both Info")
+    check(_int_or_none(True) is None and _int_or_none(" 12 ") == 12
+          and _int_or_none("twelve") is None,
+          "a count is parsed from a CIM string, and a bool is never read as "
+          "a count  <-- pinned defect")
+
+    check(_driver_age_days("2023-10-01T00:00:00.0000000+01:00",
+                           1700000000.0) == 44,
+          "a driver date is read as an age in days, and the CIM offset "
+          "suffix does not break it")
+    check(_driver_age_days("garbage", 1700000000.0) is None
+          and _driver_age_days(None, 1700000000.0) is None,
+          "an unreadable date answers nothing rather than zero: read as zero "
+          "it would pass the one check Esri's own guide leads with "
+          "<-- pinned defect")
+    check(_driver_age_days("2030-01-01", 1700000000.0) is None,
+          "and a date in the future answers nothing rather than a negative "
+          "age that would always pass")
+    check(decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                       "driver": "31.0.15.3623",
+                       "date": "2023-10-01"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "a driver a few weeks old passes")
+    check(decide_gpu([{"name": "Intel UHD Graphics 620",
+                       "driver": "27.20.100.8681",
+                       "date": "2022-01-10"}], None, 1700000000.0)["status"]
+          == "Warn",
+          "and a driver more than a year old warns: Esri's troubleshooting "
+          "guide asks for a driver from the GPU maker as its first step")
+    warp = decide_gpu([{"name": "Microsoft Basic Render Driver (WARP)",
+                        "driver": "10.0", "date": "2023-10-01"}],
+                      None, 1700000000.0)
+    check(warp["status"] == "Fail" and "emulating" in warp["impact"],
+          "WARP is a Fail and says Pro is emulating a GPU on the CPU: it is "
+          "the most common cause of a session that hangs on draw "
+          "<-- pinned defect")
+    no_date = decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                           "driver": "31.0", "date": None}],
+                         None, 1700000000.0)
+    check(no_date["status"] == "Info" and no_date["measured"] is False,
+          "a driver with no readable date is Info and unmeasured, not a Pass "
+          "on an age of zero  <-- pinned defect")
+    check(decide_gpu([], "access denied", 1700000000.0)["status"] == "Info"
+          and decide_gpu([], None, 1700000000.0)["status"] == "Info",
+          "an unread adapter list and an empty one are both Info")
+    check(decide_gpu([{"name": "NVIDIA GeForce RTX 3060", "driver": "31.0",
+                       "date": "2023-10-01"},
+                      {"name": "Intel UHD Graphics", "driver": "31.0",
+                       "date": "2022-01-10"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "with a discrete GPU and an integrated one, the newest driver "
+          "decides: pinning ArcGISPro.exe to the discrete card is the fix "
+          "<-- pinned defect")
+
+    check(_gdb_owner(r"C:\\data\\parcels.gdb\\a00000001.gdbtable")
+          == "parcels.gdb",
+          "a file inside a file geodatabase is attributed to that geodatabase")
+    check(_gdb_owner(r"C:\\data\\shape\\parcels.shp") is None,
+          "and a shapefile beside it is attributed to none")
+
+    big = {"root": r"C:\\gis", "bytes": 40 * 1024 ** 3, "files": 900,
+           "gdbs": {"parcels.gdb": (40 * 1024 ** 3, 890)},
+           "unreadable": [], "capped": False}
+    check(decide_data_weight([big])["status"] == "Warn",
+          "a forty-gigabyte file geodatabase warns: it is slow to open, to "
+          "edit, and slowest of all on a share or a spinning disk")
+    many = {"root": r"C:\\gis", "bytes": 2 * 1024 ** 3, "files": 9000,
+            "gdbs": {}, "unreadable": [], "capped": False}
+    check(decide_data_weight([many])["status"] == "Warn",
+          "and nine thousand small files warn on their own: a synced folder "
+          "tracks every file, so count costs more than size")
+    check(decide_data_weight([{"root": r"C:\\gis", "bytes": 1024,
+                               "files": 3, "gdbs": {},
+                               "unreadable": [], "capped": False}])["status"]
+          == "Pass",
+          "a small local folder passes")
+    capped = decide_data_weight([{"root": r"C:\\gis", "bytes": 1024,
+                                  "files": 3, "gdbs": {}, "unreadable": [],
+                                  "capped": True}])
+    check(capped["status"] == "Info",
+          "a scan that stopped early cannot prove the folder is small, so it "
+          "answers Info rather than a Pass the walk never produced "
+          "<-- pinned defect")
+    unread = decide_data_weight([{"root": r"C:\gis", "bytes": 1024,
+                                  "files": 3, "gdbs": {},
+                                  "unreadable": [r"C:\gis\locked: denied"],
+                                  "capped": False}])
+    check("unreadable" in " ".join(unread["observed"]),
+          "a folder the walk could not open is named, not silently left out "
+          "of the total  <-- pinned defect")
+    check(decide_data_weight([])["status"] == "Info",
+          "no recent project means no folder to weigh, which is Info")
+    check(decide_data_weight([big])["kpi"]["largest_gdb_gib"] == 40.0,
+          "the heaviest geodatabase is carried as a number so the report can "
+          "gauge it")
+
+    check(decide_cpu([{"name": "Celeron", "cores": 1, "logical": 2,
+                       "mhz": 1100}], None)["status"] == "Fail",
+          "one core is below Esri's published minimum of two and is a Fail, "
+          "not a Warn: Pro will not run properly on it")
+    check(decide_cpu([{"name": "i5", "cores": 2, "logical": 4,
+                       "mhz": 1608}], None)["status"] == "Warn",
+          "two cores with hyperthreading is Esri's bare MINIMUM, and it is a "
+          "Warn: grading on logical processors would have passed it as if it "
+          "met the four-core recommendation  <-- pinned defect")
+    check(decide_cpu([{"name": "i7", "cores": 4, "logical": 8,
+                       "mhz": 2800}], None)["status"] == "Pass",
+          "four cores meets Esri's published recommendation and passes")
+    check("Esri" in decide_cpu([{"name": "i7", "cores": 8, "logical": 16,
+                                 "mhz": 2304}], None)["expected"],
+          "the CPU check names Esri as the source of its tiers rather than "
+          "presenting a number this tool chose as if Esri published it")
+
+    only_int = decide_gpu([{"name": "Intel(R) UHD Graphics 620",
+                            "driver": "31.0", "date": "2023-10-01"}],
+                          None, 1700000000.0)
+    check(only_int["status"] == "Warn"
+          and "discrete" in " ".join(only_int["observed"]),
+          "a recent driver on an integrated-only adapter still warns: Esri "
+          "recommends a discrete GPU, and a fresh driver does not change the "
+          "silicon  <-- pinned defect")
+    check(decide_gpu([{"name": "Intel(R) UHD Graphics 620", "driver": "31.0",
+                       "date": "2023-10-01"},
+                      {"name": "NVIDIA GeForce RTX 3060", "driver": "31.0",
+                       "date": "2023-10-01"}], None, 1700000000.0)["status"]
+          == "Pass",
+          "and an integrated chip beside a discrete one is fine: pinning Pro "
+          "to the discrete card (PF-11) is the fix, not a hardware complaint")
+    check("Esri" in decide_gpu([{"name": "NVIDIA GeForce RTX 3060",
+                                 "driver": "31.0", "date": "2023-10-01"}],
+                               None, 1700000000.0)["expected"],
+          "the GPU check quotes Esri's own 'use the latest available driver' "
+          "instead of only this tool's day count")
+    check(any("arcgis-pro-system-requirements" in u
+              for pairs in SOURCES.values() for _l, u in pairs),
+          "Esri's published system-requirements page is cited in the report, "
+          "so the numbers a reader is asked to compare against can be "
+          "checked  <-- pinned defect")
+
+    registered = set(cid for cid, _c, _t, _d, _p
+                     in registrations(FakeEnv(), {}, {}))
+    unknown = sorted(set(SOURCES) - registered)
+    check(not unknown,
+          "every check id in SOURCES is a check the tool actually registers, "
+          "so no source is attached to a check that no longer exists "
+          "<-- pinned defect")
+    malformed = sorted(cid for cid, pairs in SOURCES.items()
+                       for pair in pairs
+                       if len(pair) != 2 or not pair[0] or not pair[1])
+    check(not malformed,
+          "every source is a label and a URL, and neither is empty")
+    insecure = sorted(u for pairs in SOURCES.values() for _l, u in pairs
+                      if not u.startswith("https://"))
+    check(not insecure,
+          "every source is https: the report is read on machines where a "
+          "plain-http link would be rewritten or blocked outright")
+    check(len(SOURCES) >= 30,
+          "the great majority of the checks carry at least one remediation "
+          "source; a check with no honest source is simply absent rather "
+          "than padded with an invented citation")
+    sourced = [c for c in run(FakeEnv(ps={"smb": ({}, None)}),
+                              {"sde_server": None, "sde_port": 1433,
+                               "portal": None, "timeout": 4000,
+                               "verbose": False, "apply": False})["checks"]
+               if c.get("sources")]
+    check(len(sourced) >= 30,
+          "and the sources reach the finished report document, not just the "
+          "table they were written in  <-- pinned defect")
+    check(all(isinstance(c["sources"], list)
+              and all(len(p) == 2 for p in c["sources"]) for c in sourced),
+          "each one arrives as a list of (label, url) pairs the renderer can "
+          "walk without a special case")
+
     check(_ps_rows({"name": "one", "media": "SSD"}, "name", "media")
           == [("one", "SSD")],
           "a single PowerShell row is unwrapped: ConvertTo-Json drops the "
@@ -6182,6 +6998,8 @@ def self_test():
         # refusal working, and it is pinned rather than assumed.
         "PF-01": "Info", "PF-09": "Info", "PF-10": "Info", "PF-14": "Info",
         "PF-16": "Warn", "PF-18": "Warn", "PF-20": "Warn", "PF-21": "Warn",
+        "PF-28": "Warn", "PF-29": "Warn",
+        "PF-30": "Pass",
     }
     for cid in sorted(expected_run):
         check(got.get(cid) == expected_run[cid],
@@ -7992,7 +8810,7 @@ def main(argv=None):
 
 # ============================================================================
 # 2/3  HTML report renderer
-# source: html_report.py  (sha256:55de8bc2d7fc)
+# source: html_report.py  (sha256:beb3f3098f4f)
 # ----------------------------------------------------------------------------
 # r"""Render an ArcGIS Pro Performance Analyser report as one self-contained
 # HTML page.
@@ -8432,6 +9250,10 @@ Consolas,"Courier New",monospace}
 padding:9px 11px;font-size:13px;margin-top:8px}
 .check.is-fail .sol,.check.is-warn .sol{background:#f7fbf8}
 .impact{font-size:13px;color:var(--mut)}
+.srclist{margin:0;padding-left:1.1rem;font-size:13px}
+.srclist li{margin:.15rem 0}
+.srclist a{color:#0b5cad;text-decoration:none;word-break:break-word}
+.srclist a:hover{text-decoration:underline}
 details{margin-top:8px}
 details summary{cursor:pointer;font-size:12px;color:var(--mut)}
 .kpichips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
@@ -8634,6 +9456,18 @@ def _check_card(check):
     else:
         parts.append('<div class="blk">%s</div>'
                      % _multiline(check.get("observed")))
+
+    # Sources are rendered for EVERY status, not only Warn/Fail: an Info
+    # check is still a check whose reference someone may want to read.
+    # These are navigation links, not resources - the page downloads
+    # nothing from these hosts, and the report's own CSP still forbids it.
+    sources = check.get("sources") or []
+    if sources:
+        items = "".join(
+            '<li><a href="%s" rel="noopener noreferrer">%s</a></li>'
+            % (esc(url), esc(label)) for label, url in sources)
+        parts.append('<div class="blk"><div class="h">Sources</div>'
+                     '<ul class="srclist">%s</ul></div>' % items)
 
     kpi = check.get("kpi") or {}
     if kpi:
@@ -8870,7 +9704,7 @@ def write_html(document, path, verbose=False, exit_code=None, meta=None):
 
 # ============================================================================
 # 3/3  ArcGIS Pro toolbox glue
-# source: toolbox_glue.py  (sha256:238f270b063c)
+# source: toolbox_glue.py  (sha256:081b144a742d)
 # ----------------------------------------------------------------------------
 # r"""The ArcGIS Pro glue: two geoprocessing tools over the diagnostic engine
 # and the HTML renderer.
@@ -8967,13 +9801,12 @@ class Toolbox(object):
         self.label = "ArcGIS Pro Performance Analyser"
         self.alias = "properf"
         self.description = (
-            "Deux outils.  1) Diagnostiquer la lenteur d'ArcGIS Pro : "
-            "celui qu'on lance - il lit ce poste et rend un rapport HTML. "
-            "2) Verifier l'analyseur : un controle du fichier lui-meme, a "
-            "lancer une fois sur une nouvelle machine avant de croire un "
-            "rapport. Lecture seule tant que les correctifs ne sont pas "
-            "coches.")
-        self.tools = [Diagnose, VerifyAnalyser]
+            "Diagnostique pourquoi ArcGIS Pro est lent sur ce poste, et ne "
+            "rapporte jamais une trouvaille que la machine n'a pas "
+            "produite. Rend un rapport HTML, contrôle par contrôle : ce qui "
+            "a été mesuré, ce que cela coûte à ArcGIS Pro, et quoi faire. "
+            "Lecture seule tant que les correctifs ne sont pas cochés.")
+        self.tools = [Diagnose]
         self.canRunInBackground = False
 
 
@@ -8983,27 +9816,29 @@ class Diagnose(object):
     def __init__(self):
         self.label = "Diagnostiquer la lenteur d'ArcGIS Pro"
         self.description = (
-            "L'OUTIL A LANCER. Lit ce poste - registre, stockage, "
-            "redirection OneDrive, reseau, cache - et rend un rapport HTML "
-            "qui dit, controle par controle, ce qui a ete mesure, ce que "
-            "cela coute a ArcGIS Pro et comment le corriger. Trente-six "
-            "controles, dont treize portent sur des modifications qui "
-            "peuvent se perdre. Lecture seule, sauf si vous cochez "
-            "explicitement les correctifs. Ecrit un HTML, un JSON et un "
-            "texte. Les parametres par defaut suffisent pour un premier "
-            "passage : ne renseignez rien.")
+            "L'OUTIL À LANCER. Lit ce poste — registre, stockage, "
+            "redirection OneDrive, réseau, processeur, carte graphique, "
+            "cache, journal d'événements — et rend un rapport HTML qui dit, "
+            "contrôle par contrôle, ce qui a été mesuré, ce que cela coûte à "
+            "ArcGIS Pro et comment le corriger. Trente-huit contrôles, dont "
+            "treize portent sur des modifications qui peuvent se perdre, et "
+            "un qui relève dans le journal d'événements les plantages, les "
+            "suspensions et les fermetures sans arrêt propre. Lecture seule, "
+            "sauf si vous cochez explicitement les correctifs. Écrit un HTML, "
+            "un JSON et un texte. Les paramètres par défaut suffisent pour un "
+            "premier passage : ne renseignez rien.")
         self.canRunInBackground = False
         self.category = "Diagnostic"
 
     def getParameterInfo(self):
         def hinted(param, tooltip, long_help):
-            """Attach the two help fields ArcGIS Pro shows for a parameter.
+            """Attache les deux champs d'aide qu'ArcGIS Pro affiche.
 
-            `helpMessage` is the tooltip behind the little question mark;
-            `parameterHelp` is the paragraph in the tool's help panel. Both are
-            filled in here rather than left to the display name, because the
-            display name has to stay short enough to fit the pane, and a short
-            label cannot carry an example.
+            `helpMessage` est l'infobulle derrière le petit point
+            d'interrogation ; `parameterHelp` est le paragraphe du volet
+            d'aide de l'outil. Les deux sont remplis ici plutôt que laissés au
+            libellé, parce que le libellé doit rester assez court pour tenir
+            dans le volet — et un libellé court ne peut pas porter d'exemple.
             """
             param.helpMessage = tooltip
             param.parameterHelp = long_help
@@ -9019,122 +9854,158 @@ class Diagnose(object):
             arcpy.env.scratchFolder or os.environ.get("TEMP") or ".",
             "ArcGISPro_PerformanceAnalyser")
         hinted(out,
-               "Ou ecrire les rapports. Laisse vide pour garder le defaut.",
-               "<p>Dossier ou l'outil ecrit ses trois fichiers : le rapport "
-               "<b>HTML</b> (celui qu'on lit), le <b>JSON</b> (pour comparer "
-               "deux passages) et le <b>TXT</b> (pour coller dans un ticket).</p>"
-               "<p><b>Defaut</b> : <code>&lt;scratch&gt;\\ArcGISPro_Performance"
-               "Analyser</code>. Le dossier est cree s'il n'existe pas.</p>"
+               "Où écrire les rapports. Laissez vide pour garder le défaut.",
+               "<p><b>À quoi ça sert</b> : c'est le dossier où l'outil écrit "
+               "ses trois fichiers — le rapport <b>HTML</b> (celui qu'on lit), "
+               "le <b>JSON</b> (pour comparer deux passages) et le <b>TXT</b> "
+               "(pour coller dans un ticket).</p>"
+               "<p><b>Défaut</b> : <code>&lt;scratch&gt;\\ArcGISPro_Performance"
+               "Analyser</code>. Le dossier est créé s'il n'existe pas.</p>"
                "<p><b>Exemple</b> : <code>C:\\Temp\\diag_analyser</code>. "
-               "Choisissez un dossier <b>local</b>, pas un partage reseau : "
-               "l'ecriture doit rester rapide et ne dependre d'aucun "
-               "serveur.</p>"
-               "<p>Rien d'existant n'est ecrase : deux passages dans la meme "
-               "seconde produisent deux jeux de fichiers.</p>")
+               "Choisissez un dossier <b>local</b>, jamais un partage réseau ni "
+               "un dossier OneDrive : l'écriture doit rester rapide et ne "
+               "dépendre d'aucun serveur. Un rapport écrit sur un partage "
+               "synchronisé peut être lu à moitié.</p>"
+               "<p><b>Rien d'existant n'est écrasé</b> : deux passages dans la "
+               "même seconde produisent deux jeux de fichiers distincts.</p>")
 
         sde = arcpy.Parameter(
-            displayName="Hote de la geodatabase d'entreprise a sonder",
+            displayName="Hôte de la géodatabase d'entreprise à sonder",
             name="sde_server",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        sde.category = "Sondes reseau (sur demande)"
+        sde.category = "Sondes réseau (sur demande)"
         hinted(sde,
-               "Nom du serveur SQL/Oracle de vos donnees. Vide = aucun "
-               "hote contacte.",
+               "Nom du serveur SQL/Oracle de vos données. Vide = aucun hôte "
+               "contacté.",
+               "<p><b>À quoi ça sert</b> : une latence élevée vers ce serveur "
+               "explique à elle seule un Pro lent à l'ouverture des cartes. Le "
+               "contrôle DL-10 mesure le temps de réponse.</p>"
                "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b> Vide, "
-               "aucun paquet ne quitte la machine et le controle DL-10 repond "
+               "aucun paquet ne quitte la machine et DL-10 répond "
                "<code>Info</code> au lieu d'inventer une mesure.</p>"
-               "<p>Renseigne, l'outil ouvre <b>une seule</b> connexion TCP, "
-               "mesure le temps de reponse, puis referme. Il ne s'authentifie "
-               "jamais et n'envoie aucun identifiant.</p>"
+               "<p>Renseigné, l'outil ouvre <b>une seule</b> connexion TCP, "
+               "mesure le temps de réponse, puis referme. Il ne s'authentifie "
+               "jamais et n'envoie aucun identifiant — il n'existe d'ailleurs "
+               "aucun paramètre de mot de passe.</p>"
                "<p><b>Exemple</b> : <code>gisdb01</code> ou "
-               "<code>gisdb01.monorg.ch</code>. C'est le serveur nomme dans "
-               "vos fichiers de connexion <code>.sde</code>.</p>"
-               "<p><b>A quoi ca sert</b> : une latence elevee vers ce serveur "
-               "explique a elle seule un Pro lent a l'ouverture des cartes.</p>")
+               "<code>gisdb01.monorg.ch</code>. C'est le serveur nommé dans "
+               "vos fichiers de connexion <code>.sde</code> ; le contrôle "
+               "DL-11 les liste pour vous.</p>")
 
         port = arcpy.Parameter(
-            displayName="Port de la geodatabase",
+            displayName="Port de la géodatabase",
             name="sde_port",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         port.value = 1433
-        port.category = "Sondes reseau (sur demande)"
+        port.category = "Sondes réseau (sur demande)"
         hinted(port,
-               "Port du serveur. 1433 = SQL Server (le plus courant).",
-               "<p><b>Defaut</b> : <code>1433</code> (SQL Server).</p>"
+               "Port du serveur. 1433 = SQL Server, le plus courant.",
+               "<p><b>À quoi ça sert</b> : c'est le port sur lequel la sonde "
+               "DL-10 se connecte. Un port fermé se lit comme un serveur "
+               "injoignable, ce qui est une fausse piste si le moteur n'est "
+               "simplement pas le bon.</p>"
+               "<p><b>Défaut</b> : <code>1433</code> (SQL Server).</p>"
                "<p><b>Valeurs courantes</b> : <code>1433</code> SQL Server, "
                "<code>1521</code> Oracle, <code>5432</code> PostgreSQL.</p>"
-               "<p>Si vous ne connaissez pas le moteur, laissez 1433 : un port "
-               "ferme repond « ferme », ce qui est deja une information, et "
-               "l'outil ne devine jamais.</p>")
+               "<p><b>Exemple</b> : si vos <code>.sde</code> nomment un serveur "
+               "PostgreSQL, mettez <code>5432</code>. Dans le doute, laissez "
+               "1433 : l'outil ne devine jamais, il dit ce qu'il a trouvé.</p>"
+               "<p>Les valeurs hors de 1 à 65535 sont refusées avant "
+               "l'exécution.</p>")
 
         portal = arcpy.Parameter(
-            displayName="Hote du portail a sonder (port 443)",
+            displayName="Hôte du portail à sonder (port 443)",
             name="portal",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        portal.category = "Sondes reseau (sur demande)"
+        portal.category = "Sondes réseau (sur demande)"
         hinted(portal,
                "Adresse de votre portail ou d'ArcGIS Online. Vide = aucun "
-               "hote contacte.",
+               "hôte contacté.",
+               "<p><b>À quoi ça sert</b> : Pro interroge le portail au "
+               "démarrage et pour chaque couche publiée. Un portail lent se "
+               "lit comme un Pro lent à l'ouverture, sans qu'aucune couche "
+               "soit en cause. Le contrôle PF-19 mesure cette réponse.</p>"
                "<p><b>Laissez vide si vous ne savez pas quoi mettre.</b></p>"
                "<p><b>Exemple</b> : <code>gis.monorg.ch</code> pour un Portal "
                "for ArcGIS interne, ou <code>www.arcgis.com</code> pour "
                "ArcGIS Online.</p>"
-               "<p>Une seule connexion TCP sur le port 443, mesuree puis "
-               "refermee. Aucun identifiant n'est envoye.</p>")
+               "<p>Une seule connexion TCP sur le port 443, mesurée puis "
+               "refermée. Aucun identifiant n'est envoyé, aucune page n'est "
+               "téléchargée.</p>")
 
         timeout = arcpy.Parameter(
-            displayName="Delai des sondes (millisecondes)",
+            displayName="Délai des sondes (millisecondes)",
             name="timeout",
             datatype="GPLong",
             parameterType="Optional",
             direction="Input")
         timeout.value = 4000
-        timeout.category = "Sondes reseau (sur demande)"
+        timeout.category = "Sondes réseau (sur demande)"
         hinted(timeout,
-               "Duree maximale de chaque sonde. 4000 ms convient presque "
-               "toujours.",
-               "<p><b>Defaut</b> : <code>4000</code> ms (4 secondes).</p>"
-               "<p>C'est une <b>borne</b>, pas une attente : une sonde qui "
-               "repond en 40 ms rend la main en 40 ms. Le delai ne sert que "
-               "pour un serveur injoignable.</p>"
-               "<p>Augmentez a <code>10000</code> sur un reseau tres lent, "
-               "descendez a <code>1500</code> pour un passage plus rapide.</p>")
+               "Plafond d'attente des sondes réseau. Une borne, pas une "
+               "attente.",
+               "<p><b>À quoi ça sert</b> : c'est le temps maximal que DL-10 et "
+               "PF-19 attendent avant de déclarer l'hôte injoignable.</p>"
+               "<p><b>Défaut</b> : <code>4000</code> ms.</p>"
+               "<p><b>C'est une borne, pas une attente</b> : une sonde qui "
+               "répond en 40 ms rend la main aussitôt. Rien n'est bloqué "
+               "pendant quatre secondes quand le serveur est rapide.</p>"
+               "<p><b>Exemple</b> : montez à <code>10000</code> sur une liaison "
+               "VPN lente, pour ne pas lire « injoignable » sur un serveur qui "
+               "répond en six secondes. Descendez à <code>1500</code> pour un "
+               "passage rapide en atelier.</p>"
+               "<p>Ce paramètre ne concerne <b>que</b> les sondes que vous avez "
+               "demandées : videz les deux hôtes et il ne sert plus à "
+               "rien.</p>")
 
         verbose = arcpy.Parameter(
-            displayName="Detaille (valeur attendue et lignes de preuve)",
+            displayName="Détaillé",
             name="verbose",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         verbose.value = False
         hinted(verbose,
-               "Affiche ce que l'outil attendait et ce qu'il a reellement lu.",
-               "<p><b>Defaut</b> : decoche.</p>"
-               "<p>Cochez-le quand vous devez <b>prouver</b> un resultat a "
-               "quelqu'un : chaque controle montre alors la valeur attendue et "
-               "la ligne brute lue sur la machine, en plus du verdict.</p>"
-               "<p>Decoche, le rapport reste complet ; seules ces lignes de "
-               "preuve sont repliees.</p>")
+               "Affiche ce que l'outil attendait et ce qu'il a réellement "
+               "lu.",
+               "<p><b>À quoi ça sert</b> : à <b>prouver</b> un résultat à "
+               "quelqu'un. Chaque contrôle montre alors la valeur attendue et "
+               "la ligne brute lue sur la machine, en plus du verdict. C'est "
+               "ce qu'il faut joindre quand le support demande « sur quoi vous "
+               "basez-vous ? ».</p>"
+               "<p><b>Défaut</b> : décoché.</p>"
+               "<p>Décoché, le rapport reste complet et tous les verdicts sont "
+               "là ; seules ces lignes de preuve sont repliées.</p>"
+               "<p><b>Exemple</b> : cochez-le avant un appel au support Esri, "
+               "puis joignez le <code>.txt</code> — il contiendra les valeurs "
+               "brutes qui appuient chaque ligne.</p>")
 
         text = arcpy.Parameter(
-            displayName="Ecrire aussi le rapport texte",
+            displayName="Écrire aussi le rapport texte",
             name="write_text",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
         text.value = True
         hinted(text,
-               "Ajoute un .txt, pratique a coller dans un ticket.",
-               "<p><b>Defaut</b> : coche.</p>"
-               "<p>Le <code>.txt</code> reprend le rapport HTML en texte brut. "
-               "C'est le format a coller dans un appel au support ou dans un "
-               "courriel, parce qu'il ne depend d'aucun navigateur.</p>")
+               "Ajoute un .txt, pratique à coller dans un ticket.",
+               "<p><b>À quoi ça sert</b> : le <code>.txt</code> reprend le "
+               "rapport HTML en texte brut. C'est le format à coller dans un "
+               "appel au support ou dans un courriel, parce qu'il ne dépend "
+               "d'aucun navigateur et qu'il passe dans n'importe quelle "
+               "messagerie.</p>"
+               "<p><b>Défaut</b> : coché.</p>"
+               "<p><b>Exemple</b> : laissez-le coché. Décochez-le seulement si "
+               "le dossier de sortie est soumis à un quota serré, ou si vous "
+               "ne voulez qu'un seul fichier.</p>"
+               "<p>Le JSON est écrit dans tous les cas : c'est lui qui permet "
+               "de comparer deux passages à quelques jours d'écart.</p>")
 
         browser = arcpy.Parameter(
             displayName="Ouvrir le rapport HTML dans le navigateur",
@@ -9144,15 +10015,22 @@ class Diagnose(object):
             direction="Input")
         browser.value = True
         hinted(browser,
-               "Ouvre le rapport a la fin. Decochez pour un lot ou un modele.",
-               "<p><b>Defaut</b> : coche.</p>"
-               "<p>Le rapport s'ouvre dans le navigateur par defaut. "
-               "Decochez-le si l'outil tourne dans un modele ModelBuilder, ou "
-               "si le navigateur est bloque par strategie de groupe : le fichier est ecrit dans "
-               "tous les cas et son chemin apparait dans les messages.</p>")
+               "Ouvre le rapport à la fin. Décochez pour un lot ou un "
+               "modèle.",
+               "<p><b>À quoi ça sert</b> : le rapport s'ouvre dans le "
+               "navigateur par défaut dès qu'il est écrit, pour ne pas avoir à "
+               "chercher le fichier.</p>"
+               "<p><b>Défaut</b> : coché.</p>"
+               "<p><b>Exemple</b> : décochez-le si l'outil tourne dans un "
+               "modèle ModelBuilder ou dans un lot — une fenêtre qui s'ouvre à "
+               "chaque itération bloque le lot. Décochez-le aussi si le "
+               "navigateur est bloqué par stratégie de groupe.</p>"
+               "<p><b>Le fichier est écrit dans tous les cas</b> et son chemin "
+               "apparaît dans les messages de l'outil : rien n'est perdu si "
+               "l'ouverture échoue.</p>")
 
         apply_fixes = arcpy.Parameter(
-            displayName="Appliquer les correctifs (renomme le cache, epingle "
+            displayName="Appliquer les correctifs (renomme le cache, épingle "
                         "le choix de carte graphique)",
             name="apply_fixes",
             datatype="GPBoolean",
@@ -9161,25 +10039,32 @@ class Diagnose(object):
         apply_fixes.value = False
         apply_fixes.category = "Modifie la machine"
         hinted(apply_fixes,
-               "SEUL parametre qui modifie la machine. Laisse decoche, "
-               "l'outil est en lecture seule.",
-               "<p><b>Defaut</b> : <b>decoche</b>. L'outil ne fait alors que "
-               "lire.</p>"
-               "<p>Coche, deux correctifs seulement, et chacun seulement si son "
-               "propre controle l'a justifie :</p>"
+               "SEUL paramètre qui modifie la machine. Décoché, l'outil est en "
+               "lecture seule.",
+               "<p><b>À quoi ça sert</b> : c'est l'interrupteur entre « lire » "
+               "et « réparer ». Tant qu'il est décoché, l'outil ne fait que "
+               "lire la machine et n'y change rien.</p>"
+               "<p><b>Défaut</b> : <b>décoché</b>.</p>"
+               "<p>Cochez-le et <b>deux correctifs seulement</b> s'appliquent, "
+               "chacun uniquement si son propre contrôle l'a justifié :</p>"
                "<ul>"
                "<li><b>AP-01</b> renomme le dossier de cache ESRI en lui "
                "ajoutant un suffixe <code>.properf-&lt;date&gt;</code>. "
-               "<b>Rien n'est supprime</b> : l'ancien dossier reste sur le "
-               "disque et Pro en reconstruit un neuf. Refuse depuis Pro, parce "
+               "<b>Rien n'est supprimé</b> : l'ancien dossier reste sur le "
+               "disque et Pro en reconstruit un neuf. Refusé depuis Pro, parce "
                "que Pro tient ce dossier.</li>"
-               "<li><b>AP-02</b> ecrit la preference « carte graphique "
-               "hautes performances » pour <code>ArcGISPro.exe</code>, dans "
-               "<code>HKCU</code> uniquement.</li>"
+               "<li><b>AP-02</b> épingle ArcGIS Pro sur la carte graphique "
+               "hautes performances, en écrivant la préférence pour "
+               "<code>ArcGISPro.exe</code> dans <code>HKCU</code> uniquement "
+               "— jamais dans la ruche machine, donc sans droit "
+               "administrateur.</li>"
                "</ul>"
-               "<p><b>Chaque correctif applique affiche sa propre commande "
-               "d'annulation</b> dans les messages et dans le rapport. Copiez-"
-               "la avant de fermer la fenetre.</p>")
+               "<p><b>Chaque correctif appliqué affiche sa propre commande "
+               "d'annulation</b>, dans les messages et dans le rapport. "
+               "Copiez-la avant de fermer la fenêtre.</p>"
+               "<p><b>Exemple</b> : faites d'abord un passage <b>décoché</b>, "
+               "lisez le rapport, puis relancez coché seulement si AP-01 ou "
+               "AP-02 y figure comme proposé.</p>")
 
         html_out = arcpy.Parameter(
             displayName="Rapport HTML",
@@ -9188,12 +10073,17 @@ class Diagnose(object):
             parameterType="Derived",
             direction="Output")
         hinted(html_out,
-               "Sortie : chemin du rapport HTML. Ne se remplit pas a la main.",
-               "<p><b>Sortie derivee</b> : l'outil la remplit lui-meme avec le "
-               "chemin du rapport ecrit.</p>"
-               "<p>Elle existe pour que l'outil puisse etre <b>enchaine</b> "
-               "dans un modele ModelBuilder : un outil suivant peut reprendre "
-               "ce chemin.</p>")
+               "Sortie : chemin du rapport HTML. Ne se remplit pas à la main.",
+               "<p><b>À quoi ça sert</b> : c'est une <b>sortie dérivée</b> — "
+               "l'outil la remplit lui-même avec le chemin du rapport qu'il "
+               "vient d'écrire.</p>"
+               "<p><b>Ne la remplissez pas</b> : elle est en lecture seule et "
+               "toute valeur saisie serait ignorée.</p>"
+               "<p>Elle existe pour que l'outil puisse être <b>enchaîné</b> "
+               "dans un modèle ModelBuilder.</p>"
+               "<p><b>Exemple</b> : dans un modèle, reliez cette sortie à un "
+               "outil « Envoyer un courrier » pour joindre automatiquement le "
+               "rapport du jour.</p>")
 
         return [out, sde, port, portal, timeout, verbose, text, browser,
                 apply_fixes, html_out]
@@ -9333,83 +10223,4 @@ class Diagnose(object):
             "names and exclusion paths. Read it before you send it to anyone.")
         messages.addMessage("Analyser exit code %d: %s"
                             % (code, report.EXIT_MEANING.get(code, "?")))
-        return
-
-
-class VerifyAnalyser(object):
-    """Run the analyser's own offline assertions.
-
-    The tool's whole claim is that it never reports a finding the machine did
-    not produce, and that claim is enforced by the engine's own offline
-    assertions over its decision functions. Run this before you trust a report from a new machine.
-    It reads no registry, writes nothing and contacts no host.
-    """
-
-    def __init__(self):
-        self.label = "Verifier l'analyseur (autotest hors ligne)"
-        self.description = (
-            "PAS un diagnostic de votre poste. Cet outil verifie le "
-            "FICHIER : il rejoue ses propres assertions sur des postes de "
-            "travail de substitution et dit combien passent. A lancer une "
-            "fois sur une nouvelle machine, avant de croire un rapport - "
-            "cela prouve que la copie qu'on vous a donnee n'est pas "
-            "abimee. Ne lit aucun registre, n'ecrit rien, ne contacte "
-            "aucun hote. Aucun parametre a remplir.")
-        self.canRunInBackground = False
-        self.category = "Diagnostic"
-
-    def getParameterInfo(self):
-        result = arcpy.Parameter(
-            displayName="Result",
-            name="result",
-            datatype="GPString",
-            parameterType="Derived",
-            direction="Output")
-        return [result]
-
-    def isLicensed(self):
-        return True
-
-    def updateParameters(self, parameters):
-        return
-
-    def updateMessages(self, parameters):
-        return
-
-    def execute(self, parameters, messages):
-        import contextlib
-        import io
-
-        buffer = io.StringIO()
-        started = time.time()
-        try:
-            with contextlib.redirect_stdout(buffer):
-                code = engine.self_test()
-        except Exception as exc:
-            messages.addErrorMessage("The self-test could not run: %s: %s"
-                                     % (type(exc).__name__, exc))
-            raise arcpy.ExecuteError()
-        captured = buffer.getvalue()
-        for line in _tail(captured, 25):
-            messages.addMessage("  %s" % line)
-        lines = captured.splitlines()
-        total = len([l for l in lines if l.startswith(("PASS  ", "FAIL  "))])
-        failed = [l for l in lines if l.startswith("FAIL  ")]
-        not_run = [l for l in lines if l.startswith("SKIP  ")]
-        tail = "" if not not_run else ", %d not run" % len(not_run)
-        for line in not_run:
-            messages.addWarningMessage("  %s" % line)
-        if code == 0:
-            messages.addMessage(
-                "%d assertions, 0 failed%s, in %.1f s."
-                % (total, tail, time.time() - started))
-            parameters[0].value = "%d assertions, 0 failed%s" % (total, tail)
-        else:
-            for line in failed:
-                messages.addErrorMessage("  %s" % line)
-            messages.addErrorMessage(
-                "%d of %d assertions failed%s." % (len(failed), total, tail))
-            parameters[0].value = "%d of %d assertions failed%s" % (
-                len(failed), total, tail)
-            raise arcpy.ExecuteError()
         return
