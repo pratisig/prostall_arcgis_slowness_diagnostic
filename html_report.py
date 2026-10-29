@@ -437,6 +437,10 @@ Consolas,"Courier New",monospace}
 padding:9px 11px;font-size:13px;margin-top:8px}
 .check.is-fail .sol,.check.is-warn .sol{background:#f7fbf8}
 .impact{font-size:13px;color:var(--mut)}
+.srclist{margin:0;padding-left:1.1rem;font-size:13px}
+.srclist li{margin:.15rem 0}
+.srclist a{color:#0b5cad;text-decoration:none;word-break:break-word}
+.srclist a:hover{text-decoration:underline}
 details{margin-top:8px}
 details summary{cursor:pointer;font-size:12px;color:var(--mut)}
 .kpichips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
@@ -639,6 +643,18 @@ def _check_card(check):
     else:
         parts.append('<div class="blk">%s</div>'
                      % _multiline(check.get("observed")))
+
+    # Sources are rendered for EVERY status, not only Warn/Fail: an Info
+    # check is still a check whose reference someone may want to read.
+    # These are navigation links, not resources - the page downloads
+    # nothing from these hosts, and the report's own CSP still forbids it.
+    sources = check.get("sources") or []
+    if sources:
+        items = "".join(
+            '<li><a href="%s" rel="noopener noreferrer">%s</a></li>'
+            % (esc(url), esc(label)) for label, url in sources)
+        parts.append('<div class="blk"><div class="h">Sources</div>'
+                     '<ul class="srclist">%s</ul></div>' % items)
 
     kpi = check.get("kpi") or {}
     if kpi:

@@ -166,6 +166,114 @@ GPU_DRIVER_MAX_DAYS = 365      # past a year, "update the driver" is the answer
 # capable GPU and is emulating one on the CPU, which is slow by construction.
 GPU_EMULATED_MARKERS = ("WARP", "BASIC DISPLAY", "MICROSOFT BASIC")
 
+# Data folder weight. Measured by walking the folder a recent project lives
+# in, never by opening the .aprx: this check has to keep answering from inside
+# ArcGIS Pro, where the project-file checks are refused on purpose.
+DATA_SCAN_DEPTH = 4
+DATA_SCAN_LIMIT = 20000
+DATA_GDB_WARN_BYTES = 10 * 1024 * 1024 * 1024   # 10 GiB in one file geodatabase
+DATA_FILES_WARN = 5000        # file COUNT matters for a synced folder, not size
+
+# ---------------------------------------------------------------------------
+# SOURCES. Where each remediation comes from.
+#
+# Every URL here was actually opened, either with the fetch tool or through a
+# search result, before it was written down. A check with no honest source is
+# simply absent from this map and the report prints no Sources block for it:
+# inventing a citation to make a row look supported is worse than an empty row.
+# ---------------------------------------------------------------------------
+
+_ESRI_PERF = ("Esri - R&eacute;glages qui influent sur les performances "
+              "d'acc&eacute;s aux donn&eacute;es",
+              "https://doc.esri.com/en/arcgis-pro/latest/get-started/"
+              "layer-map-project-perf-optimization.html")
+_ESRI_TROUBLE = ("Esri - D&eacute;pannage des probl&egrave;mes de performance "
+                 "dans ArcGIS Pro",
+                 "https://community.esri.com/t5/arcgis-pro-documents/"
+                 "troubleshooting-performance-issues-in-arcgis-pro/ta-p/"
+                 "1025516")
+_ESRI_3D = ("Esri - FPS, Tri/Sec, MemMb et l'affichage WARP",
+            "https://www.esri.com/arcgis-blog/products/3d-gis/3d-gis/"
+            "troubleshooting-performance-issues-in-arcgis-pro")
+_ESRI_CACHE = ("Esri - Rendu lent : vider le cache de l'espace de travail",
+               "https://support.esri.com/en-us/knowledge-base/problem-convert-"
+               "labels-to-graphics-renders-slowly-in-ar-000034620")
+_ESRI_CA = ("Esri Canada - D&eacute;panner ArcGIS Pro comme un analyste du "
+            "support", "https://resources.esri.ca/getting-technical/"
+            "troubleshooting-arcgis-pro-like-an-esri-canada-support-analyst-"
+            "part-1")
+_ESRI_PROJ = ("Esri Community - Vitesse d'un projet ArcGIS Pro",
+              "https://community.esri.com/t5/arcgis-utility-network-questions/"
+              "arcgis-pro-project-speed/td-p/1581320")
+_MS_NIC = ("Microsoft - MSFT_NetAdapterPowerManagementSettingData",
+           "https://learn.microsoft.com/en-us/previous-versions/windows/"
+           "desktop/legacy/hh872363(v=vs.85)")
+_R_SINGLE = ("r/gis - Pro est mono-thread : 16 c\u0153urs n'y changent rien",
+             "https://www.reddit.com/r/gis/comments/t7lc3h/not_being_funny_"
+             "is_there_an_actual_reason_arcgis/")
+_R_ONEDRIVE = ("r/ArcGIS - OneDrive et les fichiers SIG : 10 min pour ouvrir "
+               "un projet", "https://www.reddit.com/r/ArcGIS/comments/"
+               "1srr0qm/one_drive_and_gis_files_question/")
+_R_ONEDRIVE2 = ("r/ArcGIS - OneDrive en \u00ab Pending \u00bb pendant un "
+                "traitement", "https://www.reddit.com/r/ArcGIS/comments/"
+                "1kix8v8/how_much_time_is_likely_left_on_this_process/")
+_R_EDITSLOW = ("r/ArcGIS - Pro ralentit \u00e0 chaque modification : "
+               "indexation, NAS, projection",
+               "https://www.reddit.com/r/ArcGIS/comments/1ni4key/"
+               "arcgis_pro_slowing_down_with_each_edit/")
+_R_CRASH = ("r/gis - Pro plante sur les gros jeux de donn&eacute;es",
+            "https://www.reddit.com/r/gis/comments/htmscu/arcgis_pro_"
+            "crashing_when_editing_large_data_sets/")
+_R_SLOWMAP = ("r/ArcGIS - Carte lente \u00e0 charger : 28 Go de JPEG "
+              "g&eacute;or&eacute;f&eacute;renc&eacute;s",
+              "https://www.reddit.com/r/ArcGIS/comments/1v82j68/"
+              "arcgis_pro_slow_loading_map/")
+_R_SHUTS = ("r/gis - \u00ab it just shuts with no warning and no saving \u00bb",
+            "https://www.reddit.com/r/gis/comments/940cyk/arcgis_pro_"
+            "performance_impressions/")
+
+SOURCES = {
+    "DL-03": [_ESRI_PROJ],
+    "DL-04": [_MS_NIC],
+    "DL-05": [_R_ONEDRIVE, _R_ONEDRIVE2],
+    "DL-06": [_R_ONEDRIVE2, _R_ONEDRIVE],
+    "DL-07": [_R_ONEDRIVE],
+    "DL-08": [_R_ONEDRIVE],
+    "DL-09": [_ESRI_TROUBLE],
+    "DL-10": [_ESRI_PERF],
+    "DL-11": [_ESRI_PERF],
+    "DL-12": [_ESRI_TROUBLE],
+    "DL-13": [_R_SHUTS, _ESRI_3D],
+    "PF-01": [_ESRI_PERF, _R_EDITSLOW],
+    "PF-02": [_ESRI_PROJ],
+    "PF-03": [_ESRI_CACHE],
+    "PF-04": [_ESRI_TROUBLE],
+    "PF-05": [_ESRI_TROUBLE, _ESRI_3D],
+    "PF-06": [_ESRI_TROUBLE, _ESRI_CACHE],
+    "PF-07": [_ESRI_PROJ],
+    "PF-08": [_ESRI_TROUBLE, _R_EDITSLOW, _ESRI_PROJ],
+    "PF-09": [_ESRI_CACHE, _R_CRASH, _R_SLOWMAP],
+    "PF-10": [_ESRI_TROUBLE, _ESRI_PROJ],
+    "PF-11": [_ESRI_TROUBLE, _ESRI_3D, _ESRI_CA],
+    "PF-12": [_ESRI_PROJ, _R_CRASH, _R_EDITSLOW],
+    "PF-13": [_ESRI_PROJ],
+    "PF-14": [_ESRI_PERF],
+    "PF-15": [_ESRI_CA],
+    "PF-16": [_R_SLOWMAP, _ESRI_PERF],
+    "PF-17": [_ESRI_TROUBLE],
+    "PF-18": [_R_EDITSLOW, _ESRI_CA],
+    "PF-19": [_ESRI_PERF],
+    "PF-20": [_ESRI_PROJ],
+    "PF-21": [_ESRI_CACHE],
+    "PF-22": [_ESRI_PERF],
+    "PF-26": [_ESRI_PROJ],
+    "PF-27": [_ESRI_PERF, _ESRI_3D],
+    "PF-28": [_R_SINGLE, _ESRI_CA],
+    "PF-29": [_ESRI_TROUBLE, _ESRI_3D],
+    "PF-30": [_R_CRASH, _R_ONEDRIVE, _R_SLOWMAP],
+}
+
+
 # One directory listing on the project share. These are this tool's
 # allowances, not a published figure: Pro lists folders many times while it
 # opens a project, so a single listing in the hundreds of milliseconds is
@@ -3708,6 +3816,158 @@ def decide_gpu(rows, error, now):
         kpi={"driver_age_days": newest})
 
 
+def _gdb_owner(path):
+    """The .gdb folder a path lives in, or None.
+
+    Split on both separators on purpose: the engine reads Windows paths on
+    whatever host it happens to run on, and os.path.split would not separate
+    a backslash path on Linux.
+    """
+    for part in re.split(r"[\\/]", path or ""):
+        if part.lower().endswith(".gdb"):
+            return part
+    return None
+
+
+def decide_data_weight(folders):
+    """PF-30. How heavy the data beside the project actually is.
+
+    Deliberately independent of the .aprx. PF-10 weighs the project file and
+    is refused whenever Pro is open, which is most of the time this tool is
+    used; a size that needs the project file open would be useless from
+    inside Pro. This one only stats files, so it answers either way.
+    """
+    title = "Data folder weight: geodatabases, rasters, file count"
+    expected = ("No single file geodatabase over %s, and fewer than %d files "
+                "in the folder the project lives in. Both thresholds are this "
+                "tool's own allowances, not published Esri figures."
+                % ("%d GiB" % (DATA_GDB_WARN_BYTES // (1024 * 1024 * 1024)),
+                   DATA_FILES_WARN))
+    if not folders:
+        return dict(
+            cid="PF-30", category="Storage", status="Info", measured=False,
+            title=title,
+            observed="No recent project was found, so there was no folder to "
+                     "weigh.",
+            expected=expected, impact="S1 and S2 undetermined.",
+            fix="Point the tool at the folder by hand: open the project's "
+                "folder in Explorer, right-click the .gdb, Properties. Or run "
+                "the command line with Pro closed so the recent list is read.")
+    lines = []
+    total = 0
+    files = 0
+    capped = False
+    unreadable = []
+    worst = None
+    for folder in folders:
+        total += folder.get("bytes", 0)
+        files += folder.get("files", 0)
+        capped = capped or folder.get("capped", False)
+        unreadable.extend(folder.get("unreadable") or [])
+        lines.append("%s: %d file(s), %s%s"
+                     % (folder.get("root", "<folder>"), folder.get("files", 0),
+                        format_bytes(folder.get("bytes", 0)),
+                        " (scan stopped early, so this is a floor)"
+                        if folder.get("capped") else ""))
+        for name, (gbytes, gfiles) in sorted(
+                (folder.get("gdbs") or {}).items(),
+                key=lambda kv: -kv[1][0]):
+            lines.append("    %s: %s in %d file(s)"
+                         % (name, format_bytes(gbytes), gfiles))
+            if worst is None or gbytes > worst[1]:
+                worst = (name, gbytes, folder.get("root", "<folder>"))
+    if unreadable:
+        lines.extend(["unreadable, so not counted: %s" % u
+                      for u in unreadable[:5]])
+        if len(unreadable) > 5:
+            lines.append("    ... %d more unreadable item(s)"
+                         % (len(unreadable) - 5))
+    lines.append("totals: %d file(s), %s%s"
+                 % (files, format_bytes(total),
+                    " (floor, the scan stopped early)" if capped else ""))
+
+    reasons = []
+    if worst and worst[1] >= DATA_GDB_WARN_BYTES:
+        reasons.append("a single file geodatabase holds %s"
+                       % format_bytes(worst[1]))
+    if files >= DATA_FILES_WARN:
+        reasons.append("%d files in the folder" % files)
+
+    if capped and not reasons:
+        # A scan that stopped early cannot prove the folder is small. Grading
+        # Pass here would be a verdict the walk did not produce.
+        lines.append("the scan stopped before the end, so a small total here "
+                     "proves nothing")
+        return dict(cid="PF-30", category="Storage", status="Info",
+                    measured=False, title=title, observed=lines,
+                    expected=expected, impact="S1 and S2 undetermined.",
+                    fix="Weigh the folder by hand in Explorer, or narrow the "
+                        "scan by moving the biggest rasters out first.")
+    if not reasons:
+        return dict(
+            cid="PF-30", category="Storage", status="Pass", title=title,
+            observed=lines, expected=expected,
+            impact="No data-weight penalty found beside the project.",
+            kpi={"data_gib": round(total / float(1024 ** 3), 2),
+                 "data_files": files})
+    return dict(
+        cid="PF-30", category="Storage", status="Warn", title=title,
+        observed=lines, expected=expected,
+        impact="S1 and S2. A file geodatabase this heavy is slow to open and "
+               "to edit, and it is slowest of all on a network share or a "
+               "spinning disk. The file count matters on its own: a synced "
+               "folder has to track every file, so ten thousand small files "
+               "cost more to sync than one large geodatabase of the same "
+               "size.",
+        fix="Split the heaviest geodatabase by theme, or export only the area "
+            "you are editing into a small working geodatabase and append back "
+            "when done. Move it to a local SSD if it currently sits on a "
+            "network share or a spinning disk - that alone has fixed this for "
+            "people whose only symptom was a slowdown. Keep it out of any "
+            "synced folder: for data that must be shared, a mobile "
+            "geodatabase has far fewer files to sync than a file geodatabase. "
+            "Rebuild the attribute and spatial indexes after a large load.",
+        kpi={"data_gib": round(total / float(1024 ** 3), 2),
+             "data_files": files,
+             "largest_gdb_gib": round(worst[1] / float(1024 ** 3), 2)
+             if worst else 0.0})
+
+
+def probe_data_weight(env, facts):
+    """PF-30. Weigh the folders the recent projects live in.
+
+    Only os.stat and a bounded walk: the .aprx is never opened, so this keeps
+    answering while Pro holds the project open.
+    """
+    roots = []
+    seen = set()
+    for path, _when, _cls in (facts.get("recent") or []):
+        parent = ntpath.dirname("%s" % path).rstrip("\\/")
+        if parent and parent.lower() not in seen:
+            seen.add(parent.lower())
+            roots.append(parent)
+    folders = []
+    for root in roots[:APRX_MAX_PROJECTS]:
+        entries, unreadable = env.scan(root, depth=DATA_SCAN_DEPTH,
+                                       limit=DATA_SCAN_LIMIT)
+        gdbs = {}
+        total = 0
+        files = 0
+        for entry in entries:
+            if entry.isdir:
+                continue
+            total += entry.size
+            files += 1
+            owner = _gdb_owner(entry.path)
+            if owner:
+                gbytes, gfiles = gdbs.get(owner, (0, 0))
+                gdbs[owner] = (gbytes + entry.size, gfiles + 1)
+        folders.append({"root": root, "bytes": total, "files": files,
+                        "gdbs": gdbs, "unreadable": unreadable,
+                        "capped": len(entries) >= DATA_SCAN_LIMIT})
+    return decide_data_weight(folders)
+
+
 def probe_cpu(env, facts):
     rows, error = env.cpu()
     return decide_cpu(rows or [], error)
@@ -4401,6 +4661,9 @@ def registrations(env, facts, opts):
          lambda: probe_cpu(env, facts)),
         ("PF-29", "Hardware", "Graphics adapter and driver age", False,
          lambda: probe_gpu(env, facts)),
+        ("PF-30", "Storage", "Data folder weight: geodatabases, rasters, "
+                              "file count", False,
+         lambda: probe_data_weight(env, facts)),
     ]
 
 
@@ -4413,6 +4676,14 @@ def run_checks(env, opts):
         def body(target, probe=probe):
             add_check(target, **probe())
         safe_check(checks, cid, category, title, body, dataloss=dataloss)
+    for check in checks:
+        # Attached after the fact rather than passed through make_check: the
+        # source belongs to the check's id, not to what the machine said, so
+        # a check that could not be measured still carries its remediation
+        # references.
+        found = SOURCES.get(check.get("id"))
+        if found:
+            check["sources"] = [list(pair) for pair in found]
     return checks, facts
 
 
@@ -6088,6 +6359,82 @@ def self_test():
           "decides: pinning ArcGISPro.exe to the discrete card is the fix "
           "<-- pinned defect")
 
+    check(_gdb_owner(r"C:\\data\\parcels.gdb\\a00000001.gdbtable")
+          == "parcels.gdb",
+          "a file inside a file geodatabase is attributed to that geodatabase")
+    check(_gdb_owner(r"C:\\data\\shape\\parcels.shp") is None,
+          "and a shapefile beside it is attributed to none")
+
+    big = {"root": r"C:\\gis", "bytes": 40 * 1024 ** 3, "files": 900,
+           "gdbs": {"parcels.gdb": (40 * 1024 ** 3, 890)},
+           "unreadable": [], "capped": False}
+    check(decide_data_weight([big])["status"] == "Warn",
+          "a forty-gigabyte file geodatabase warns: it is slow to open, to "
+          "edit, and slowest of all on a share or a spinning disk")
+    many = {"root": r"C:\\gis", "bytes": 2 * 1024 ** 3, "files": 9000,
+            "gdbs": {}, "unreadable": [], "capped": False}
+    check(decide_data_weight([many])["status"] == "Warn",
+          "and nine thousand small files warn on their own: a synced folder "
+          "tracks every file, so count costs more than size")
+    check(decide_data_weight([{"root": r"C:\\gis", "bytes": 1024,
+                               "files": 3, "gdbs": {},
+                               "unreadable": [], "capped": False}])["status"]
+          == "Pass",
+          "a small local folder passes")
+    capped = decide_data_weight([{"root": r"C:\\gis", "bytes": 1024,
+                                  "files": 3, "gdbs": {}, "unreadable": [],
+                                  "capped": True}])
+    check(capped["status"] == "Info",
+          "a scan that stopped early cannot prove the folder is small, so it "
+          "answers Info rather than a Pass the walk never produced "
+          "<-- pinned defect")
+    unread = decide_data_weight([{"root": r"C:\gis", "bytes": 1024,
+                                  "files": 3, "gdbs": {},
+                                  "unreadable": [r"C:\gis\locked: denied"],
+                                  "capped": False}])
+    check("unreadable" in " ".join(unread["observed"]),
+          "a folder the walk could not open is named, not silently left out "
+          "of the total  <-- pinned defect")
+    check(decide_data_weight([])["status"] == "Info",
+          "no recent project means no folder to weigh, which is Info")
+    check(decide_data_weight([big])["kpi"]["largest_gdb_gib"] == 40.0,
+          "the heaviest geodatabase is carried as a number so the report can "
+          "gauge it")
+
+    registered = set(cid for cid, _c, _t, _d, _p
+                     in registrations(FakeEnv(), {}, {}))
+    unknown = sorted(set(SOURCES) - registered)
+    check(not unknown,
+          "every check id in SOURCES is a check the tool actually registers, "
+          "so no source is attached to a check that no longer exists "
+          "<-- pinned defect")
+    malformed = sorted(cid for cid, pairs in SOURCES.items()
+                       for pair in pairs
+                       if len(pair) != 2 or not pair[0] or not pair[1])
+    check(not malformed,
+          "every source is a label and a URL, and neither is empty")
+    insecure = sorted(u for pairs in SOURCES.values() for _l, u in pairs
+                      if not u.startswith("https://"))
+    check(not insecure,
+          "every source is https: the report is read on machines where a "
+          "plain-http link would be rewritten or blocked outright")
+    check(len(SOURCES) >= 30,
+          "the great majority of the checks carry at least one remediation "
+          "source; a check with no honest source is simply absent rather "
+          "than padded with an invented citation")
+    sourced = [c for c in run(FakeEnv(ps={"smb": ({}, None)}),
+                              {"sde_server": None, "sde_port": 1433,
+                               "portal": None, "timeout": 4000,
+                               "verbose": False, "apply": False})["checks"]
+               if c.get("sources")]
+    check(len(sourced) >= 30,
+          "and the sources reach the finished report document, not just the "
+          "table they were written in  <-- pinned defect")
+    check(all(isinstance(c["sources"], list)
+              and all(len(p) == 2 for p in c["sources"]) for c in sourced),
+          "each one arrives as a list of (label, url) pairs the renderer can "
+          "walk without a special case")
+
     check(_ps_rows({"name": "one", "media": "SSD"}, "name", "media")
           == [("one", "SSD")],
           "a single PowerShell row is unwrapped: ConvertTo-Json drops the "
@@ -6471,6 +6818,7 @@ def self_test():
         "PF-01": "Info", "PF-09": "Info", "PF-10": "Info", "PF-14": "Info",
         "PF-16": "Warn", "PF-18": "Warn", "PF-20": "Warn", "PF-21": "Warn",
         "PF-28": "Warn", "PF-29": "Warn",
+        "PF-30": "Pass",
     }
     for cid in sorted(expected_run):
         check(got.get(cid) == expected_run[cid],

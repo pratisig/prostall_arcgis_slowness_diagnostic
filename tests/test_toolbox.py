@@ -271,10 +271,25 @@ check('<nav class="toc">' in page and 'href="#perte-donnees"' in page
     "the page opens with a sommaire that reaches both blocks")
 check("Content-Security-Policy" in page,
     "the page ships a CSP that allows no external source at all")
-check('src="http' not in page and 'href="http' not in page
-      and "@import" not in page and "url(" not in page.split("<style>")[1].split("</style>")[0],
-      "no stylesheet, script, font or image is fetched from a host: the "
+check('src="http' not in page and "@import" not in page
+      and not re.search(r'<link[^>]+href="https?://', page)
+      and not re.search(r'<script[^>]+src="https?://', page)
+      and "url(" not in page.split("<style>")[1].split("</style>")[0],
+      "no stylesheet, script, font or image is FETCHED from a host: the "
       "report opens on a workstation that may be offline or air-gapped")
+links = re.findall(r'<a href="(https?://[^"]*)"', page)
+check(all(u.startswith("https://") for u in links) and len(links) > 20,
+      "the only external references left are the remediation source links, "
+      "and every one of them is https")
+check(all(" " not in u and "<" not in u and '"' not in u for u in links),
+      "no source URL carries a space or a character that would break out of "
+      "the href attribute")
+check(page.count('rel="noopener noreferrer"') == len(links),
+      "every source link is opened without handing the target page a handle "
+      "on the report")
+check(page.count('class="srclist"') > 20,
+      "the sources are printed per check, inside the check that cites them, "
+      "rather than collected in one footnote nobody reads")
 check(all(k in page for k in ("Fail", "Warn", "Pass", "Info", "Skipped")),
     "all five statuses have a legend entry on the page")
 check("ArcGIS Pro 3.4" not in page,
@@ -496,10 +511,19 @@ check("Laissez vide" in (params[1].parameterHelp or "")
       "both network probes say what leaving them empty does, because "
       "empty is the right answer for most runs and a blank box "
       "otherwise reads as something forgotten")
-check("Rien n'est supprime" in (params[8].parameterHelp or "")
+check("Rien n'est supprimé" in (params[8].parameterHelp or "")
       and "annulation" in (params[8].parameterHelp or ""),
       "the one parameter that changes the machine says so, says nothing "
       "is deleted, and says an undo is printed")
+check(any(ord(c) > 127 for c in "".join(
+          (par.helpMessage or "") + (par.parameterHelp or "") for par in params)),
+      "the parameter help is written in accented French, not in French with "
+      "the accents stripped out: an unaccented paragraph reads as a machine "
+      "translation and the editor stops trusting the rest of the report")
+check(all("À quoi ça sert" in (par.parameterHelp or "") for par in params),
+      "every parameter opens by saying what it is FOR, before its default and "
+      "its example - the editor is not a specialist and should not have to "
+      "guess from the display name")
 
 print("-" * 70)
 print("the toolbox refuses what the analyser's parser refuses")
