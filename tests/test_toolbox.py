@@ -261,6 +261,46 @@ page = html_report.render_html(document, verbose=True,
 check(len(document["checks"]) > 0 and all(
     'data-status="%s"' % c["status"] in page for c in document["checks"]),
     "every check of the run is on the page, tagged with its own status")
+# The operator reads a name; the code is a reference kept for the support
+# case and the JSON diff. Leading with "DL-09" asked a French editor to decode
+# a code and an English title before knowing what had been tested.
+named = [c for c in document["checks"] if c.get("title_fr")]
+check(named and all(html_report.display_name(c) == c["title_fr"]
+                    for c in named),
+      "each card is headed by the French name of the check  <-- pinned defect")
+check(not any((c.get("title_fr") or "") == (c.get("title") or "")
+              for c in document["checks"]),
+      "and no card kept its English title as the heading")
+cards = re.findall(r'<div class="chead">(.*?)</div>', page, re.S)
+check(cards and all('<span class="ttl">' in card for card in cards),
+      "the heading element holds the name")
+check(len(re.findall(r'<div class="chead"><span class="ttl">', page))
+      == len(document["checks"]),
+      "the name comes first in every heading, not the code  <-- pinned defect")
+check(cards and all(card.rstrip().endswith('</span>') for card in cards)
+      and len(cards) == len(document["checks"]),
+      "each heading is closed cleanly, one per check")
+check(cards and all('<span class="ref"' in card for card in cards),
+      "and the code is rendered as a small reference")
+check('<span class="id">' not in page,
+      "the old code-as-heading element is gone from the page")
+# The renderer escapes apostrophes, so the page is compared with them
+# normalised rather than with the raw French string.
+plain = page.replace("&#x27;", "'").replace("&amp;", "&")
+check(named and all(html_report.display_name(c) in plain for c in named),
+      "every name actually reaches the page")
+check(html_report.display_name({"title": "Fallback only"}) == "Fallback only",
+      "a check with no French name falls back to its own title, never to an "
+      "empty heading")
+check(html_report.display_name({}) == "",
+      "and a nameless record renders nothing rather than raising")
+banner_start = page.find('class="banner act"')
+banner = page[banner_start:page.find("</div>", banner_start)] if banner_start >= 0 else ""
+check(not banner or ("&mdash; DL-" not in banner and "&mdash; PF-" not in banner),
+      "the act-first banner names the findings instead of leading with codes")
+check("réf. PF-12" in page or "réf. PF-13" in page,
+      "the gauges label their source as a reference, not as a bare code")
+
 ids = [c["id"] for c in document["checks"]]
 check(all((">%s<" % cid) in page or ('id">%s<' % cid) in page for cid in ids),
     "and every id appears, so no check is dropped by the renderer")
@@ -523,6 +563,52 @@ check("DisableDelayedExpansion" in batch and "chcp 65001" in batch
 check("arcgispro-py3\\python.exe" in batch and "where py" in batch
       and "where python" in batch and 'start "" "%LATEST%"' in batch,
       "Pro's Python, fallbacks and the HTML report opening are all wired")
+
+print("-" * 70)
+print("the tool carries nothing that belongs to one machine")
+# The tool is shared across an organisation, so the shipped files must never
+# name a real Windows profile, a real add-in or a real host. The fixtures that
+# do use a C:\Users\... path use a placeholder name, which is why the check is
+# a whitelist rather than a ban.
+# "*" is a wildcard this tool documents for a Defender exclusion, and "<name>"
+# is a placeholder; neither belongs to a person.
+PLACEHOLDER_PROFILES = {"editor", "ed", "relief", "moi", "example", "name",
+                        "username", "utilisateur", "<name>", "*"}
+SHIPPED = ("arcgis_pro_performance_analyser.py", "html_report.py",
+           "toolbox_glue.py", "build_toolbox.py",
+           "Diagnostiquer_ArcGIS_Pro.bat", "README.md",
+           os.path.join("ArcGISPro_PerformanceAnalyser", "LISEZMOI.md"),
+           "ArcGISPro_PerformanceAnalyser/ArcGISPro_PerformanceAnalyser.pyt")
+profile_path = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+([^\\/\"'\s,;)]+)")
+offenders = {}
+for name in SHIPPED:
+    body = io.open(os.path.join(ROOT, name), encoding="utf-8").read()
+    for match in profile_path.finditer(body):
+        profile_name = match.group(1)
+        if profile_name.lower() not in PLACEHOLDER_PROFILES:
+            offenders.setdefault(name, set()).add(profile_name)
+check(not offenders,
+      "no shipped file names a real Windows profile, so a copy pasted into a "
+      "share belongs to nobody in particular: %s"
+      % (offenders or "none found"))
+emails = {}
+for name in SHIPPED:
+    body = io.open(os.path.join(ROOT, name), encoding="utf-8").read()
+    found = [address for address in
+             re.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", body)
+             if not address.lower().endswith(("example.org", "example.com"))]
+    if found:
+        emails[name] = found
+check(not emails,
+      "and none carries a personal e-mail address: %s"
+      % (emails or "none found"))
+check("%LOCALAPPDATA%" in batch,
+      "the launcher resolves the report folder from the running account, not "
+      "from a hard-coded path")
+check("~" in io.open(os.path.join(ROOT, "arcgis_pro_performance_analyser.py"),
+                     encoding="utf-8").read(),
+      "and the engine falls back to the running user's home when the Windows "
+      "variables are absent")
 
 print("-" * 70)
 print("the .pyt loads and its tools are what ArcGIS Pro will see")
